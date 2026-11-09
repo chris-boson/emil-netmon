@@ -1,0 +1,9 @@
+build/
+dist/
+__pycache__/
+*.pyc
+.DS_Store
+# never commit monitoring data or a real hub config
+*.csv
+config.json
+defaults.json
