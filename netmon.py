@@ -44,7 +44,7 @@ VERSION = "0.6"
 APP_NAME = "EMIL NetMon"
 # The building's hub (hub/Code.gs on a Google Sheet). Everyone who clicks "Share anonymous stats"
 # sends to it; build_app.sh --hub can point a build somewhere else.
-DEFAULT_HUB = ""
+DEFAULT_HUB = "https://script.google.com/macros/s/AKfycbw9om_qfZW06Ncd7DZRw2D_WpF8JmlimX7S_N0BXi3ZOUinERiqL7oDgc-1XEksTtPXoA/exec"
 DOWNLOAD_URL = "https://github.com/chris-boson/emil-netmon/releases/latest/download/EMIL-NetMon.zip"
 DEFAULT_DIR = Path(os.environ.get("NETMON_DIR", Path.home() / ".netmon"))
 LABEL = "com.netmon.agent"
