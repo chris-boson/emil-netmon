@@ -1,21 +1,20 @@
 /**
- * netmon building hub — a Google Sheet that collects anonymous hourly summaries
- * from neighbours' netmon apps and serves them back for the building view.
+ * EMIL NetMon hub — a Google Sheet that collects anonymous hourly summaries from the
+ * EMIL NetMon apps in one building and serves them back for the Building view.
  *
- * Setup (5 minutes, see hub/README.md):
- *   1. New Google Sheet → Extensions → Apps Script → paste this file.
- *   2. Change BUILDING_CODE below to something only your neighbours get.
- *   3. Deploy → New deployment → Web app → Execute as: Me, Who has access: Anyone.
- *   4. Put the web app URL + code into netmon (Settings) or build the app with them.
+ * Setup (once, see hub/README.md): new Google Sheet → Extensions → Apps Script → paste
+ * this file → Deploy → New deployment → Web app → Execute as: Me, Who has access: Anyone.
+ * Put the /exec URL into DEFAULT_HUB in netmon.py.
  */
-const BUILDING_CODE = 'change-me';   // shared secret: needed to send AND to read data
-const KEEP_DAYS = 90;                // older rows are pruned automatically
-const MIN_POST_SECONDS = 300;        // per-device rate limit
+const KEEP_DAYS = 60;              // older rows are pruned automatically
+const MAX_DAYS_READ = 30;          // longest window a dashboard can ask for
+const MIN_POST_SECONDS = 300;      // per-device rate limit
+const MAX_ROWS = 250000;           // safety cap (~100 apartments x 24 h x 60 days fits; Sheets allows 10M cells)
 
 const COLS = ['received', 'device', 'label', 'version', 'epoch', 'hour', 'local_hour', 'gw', 'checks', 'failed',
               'slow', 'router_p50', 'router_p95', 'router_loss', 'hop_p95', 'net_p95', 'rssi', 'same_block', 'lan'];
-const NUM = new Set(['epoch', 'local_hour', 'checks', 'failed', 'slow', 'router_p50', 'router_p95', 'router_loss',
-                     'hop_p95', 'net_p95', 'rssi', 'same_block', 'lan']);
+const OUT = COLS.filter(c => c !== 'received' && c !== 'hour');  // what dashboards get back
+const C = Object.fromEntries(COLS.map((c, i) => [c, i]));       // column name -> 0-based index
 
 function json_(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
@@ -40,7 +39,6 @@ function num_(v, lo, hi) {
 function doPost(e) {
   let body;
   try { body = JSON.parse(e.postData.contents); } catch (err) { return json_({ok: false, error: 'bad JSON'}); }
-  if (body.building !== BUILDING_CODE) return json_({ok: false, error: 'wrong building code'});
   if (!/^[0-9a-f]{12}$/.test(body.device || '')) return json_({ok: false, error: 'bad device id'});
   const hours = Array.isArray(body.hours) ? body.hours.slice(-72) : [];
 
@@ -56,11 +54,13 @@ function doPost(e) {
   try {
     const sh = sheet_();
     const last = sh.getLastRow();
-    // index existing rows of this device by epoch|gw so re-sent hours are updated, not duplicated
+    if (last > MAX_ROWS) return json_({ok: false, error: 'hub is full'});
+    // index this device's existing rows by epoch|gw so re-sent hours are updated, not duplicated
     const index = {};
     if (last > 1) {
-      const keys = sh.getRange(2, 2, last - 1, 7).getValues();  // device .. gw
-      keys.forEach((k, i) => { if (k[0] === body.device) index[k[3] + '|' + k[6]] = i + 2; });
+      sh.getRange(2, C.device + 1, last - 1, C.gw - C.device + 1).getValues().forEach((k, i) => {
+        if (k[0] === body.device) index[k[C.epoch - C.device] + '|' + k[C.gw - C.device]] = i + 2;
+      });
     }
     const label = String(body.label || '').slice(0, 20);
     const version = String(body.version || '').slice(0, 10);
@@ -72,44 +72,52 @@ function doPost(e) {
                    num_(h.router_p50, 0, 1e5), num_(h.router_p95, 0, 1e5), num_(h.router_loss, 0, 100),
                    num_(h.hop_p95, 0, 1e5), num_(h.net_p95, 0, 1e5), num_(h.rssi, -120, 0),
                    num_(h.same_block, 0, 200), num_(h.lan, 0, 5000)];
-      const at = index[row[4] + '|' + gw];
+      const at = index[row[C.epoch] + '|' + gw];
       if (at) sh.getRange(at, 1, 1, COLS.length).setValues([row]);
       else append.push(row);
     });
     if (append.length) sh.getRange(sh.getLastRow() + 1, 1, append.length, COLS.length).setValues(append);
     props.setProperty(lastKey, String(now));
-    if (Math.random() < 0.05) prune_(sh);
+    if (now - Number(props.getProperty('pruned') || 0) > 86400000) {  // once a day
+      prune_(sh, props);
+      props.setProperty('pruned', String(now));
+    }
   } finally {
     lock.releaseLock();
   }
   return json_({ok: true, received: hours.length});
 }
 
+// GET ?action=building&days=7 -> {ok, cols: [...], rows: [[...], ...]} (compact: ~100 apartments x 24 h x days)
 function doGet(e) {
   const p = e.parameter || {};
-  if (p.action !== 'building') return json_({ok: true, hub: 'netmon'});
-  if (p.b !== BUILDING_CODE) return json_({ok: false, error: 'wrong building code'});
-  const days = Math.min(90, Number(p.days) || 14);
+  if (p.action !== 'building') return json_({ok: true, hub: 'emil-netmon'});
+  const days = Math.min(MAX_DAYS_READ, Number(p.days) || 7);
   const cutoff = Date.now() / 1000 - days * 86400;
   const sh = sheet_();
   const last = sh.getLastRow();
-  if (last < 2) return json_({ok: true, rows: []});
+  if (last < 2) return json_({ok: true, cols: OUT, rows: []});
+  const idx = OUT.map(c => C[c]);
   const rows = sh.getRange(2, 1, last - 1, COLS.length).getValues()
-    .filter(r => Number(r[4]) >= cutoff)
-    .map(r => {
-      const o = {};
-      COLS.forEach((c, i) => { if (c !== 'received') o[c] = NUM.has(c) ? (r[i] === '' ? null : Number(r[i])) : String(r[i]); });
-      return o;
-    });
-  return json_({ok: true, rows: rows});
+    .filter(r => Number(r[C.epoch]) >= cutoff)
+    .map(r => idx.map(i => r[i] === '' ? null : r[i]));
+  return json_({ok: true, cols: OUT, rows: rows});
 }
 
-function prune_(sh) {
+function prune_(sh, props) {
   const last = sh.getLastRow();
-  if (last < 2) return;
   const cutoff = Date.now() / 1000 - KEEP_DAYS * 86400;
-  const epochs = sh.getRange(2, 5, last - 1, 1).getValues();
-  for (let i = epochs.length - 1; i >= 0; i--) {
-    if (Number(epochs[i][0]) < cutoff) sh.deleteRow(i + 2);
+  if (last >= 2) {
+    const all = sh.getRange(2, 1, last - 1, COLS.length).getValues();
+    const keep = all.filter(r => Number(r[C.epoch]) >= cutoff);
+    if (keep.length < all.length) {  // rewrite in one go: far faster than deleting rows one by one
+      sh.getRange(2, 1, last - 1, COLS.length).clearContent();
+      if (keep.length) sh.getRange(2, 1, keep.length, COLS.length).setValues(keep);
+    }
   }
+  // forget rate-limit entries of devices that haven't posted for a day
+  const p = props.getProperties();
+  Object.keys(p).forEach(k => {
+    if (k.indexOf('last_') === 0 && Date.now() - Number(p[k]) > 86400000) props.deleteProperty(k);
+  });
 }

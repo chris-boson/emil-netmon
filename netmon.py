@@ -40,8 +40,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.5"
+VERSION = "0.6"
 APP_NAME = "EMIL NetMon"
+# The building's hub (hub/Code.gs on a Google Sheet). Everyone who clicks "Share anonymous stats"
+# sends to it; build_app.sh --hub can point a build somewhere else.
+DEFAULT_HUB = ""
+DOWNLOAD_URL = "https://github.com/chris-boson/emil-netmon/releases/latest/download/EMIL-NetMon.zip"
 DEFAULT_DIR = Path(os.environ.get("NETMON_DIR", Path.home() / ".netmon"))
 LABEL = "com.netmon.agent"
 PLIST = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
@@ -792,7 +796,7 @@ def analyze(d, hours=None, gateway=None, min_ticks=2):
 
 # =========================================================================== building sharing
 def load_config(d):
-    cfg = {"share": False, "hub_url": "", "building": "", "label": "", "device_id": "", "asked": False}
+    cfg = {"share": False, "hub_url": "", "label": "", "device_id": "", "asked": False}
     for p in (d / "defaults.json", d / "config.json"):
         try:
             cfg.update(json.loads(p.read_text()))
@@ -804,8 +808,12 @@ def load_config(d):
     return cfg
 
 
+def hub_of(cfg):
+    return cfg.get("hub_url") or DEFAULT_HUB
+
+
 def save_config(d, cfg):
-    keep = {k: cfg.get(k) for k in ("share", "hub_url", "building", "label", "device_id", "asked")}
+    keep = {k: cfg.get(k) for k in ("share", "hub_url", "label", "device_id", "asked")}
     (d / "config.json").write_text(json.dumps(keep, indent=2))
 
 
@@ -873,15 +881,54 @@ def curl_json(url, payload=None, timeout=20):
         raise RuntimeError("hub returned something that isn't JSON - check the hub URL")
 
 
-def building_view(d, days=14):
-    cfg = load_config(d)
-    if not (cfg["hub_url"] and cfg["building"]):
-        return {"configured": False}
-    sep = "&" if "?" in cfg["hub_url"] else "?"
-    res = curl_json(f"{cfg['hub_url']}{sep}action=building&b={cfg['building']}&days={days}")
+def building_rows(cfg, days):
+    hub = hub_of(cfg)
+    sep = "&" if "?" in hub else "?"
+    res = curl_json(f"{hub}{sep}action=building&days={days}", timeout=40)
     if not res.get("ok"):
-        return {"configured": True, "error": res.get("error", "hub error")}
-    rows = res.get("rows", [])
+        raise RuntimeError(res.get("error", "hub error"))
+    cols = res.get("cols", [])
+    return [dict(zip(cols, r)) for r in res.get("rows", [])]
+
+
+def building_csv(d, days=30):
+    cfg = load_config(d)
+    if not hub_of(cfg):
+        return ""
+    rows = sorted(building_rows(cfg, days), key=lambda r: (r.get("epoch") or 0, r.get("label") or "", r.get("device") or ""))
+    for r in rows:
+        r["hour"] = datetime.fromtimestamp(r["epoch"]).astimezone().isoformat() if r.get("epoch") else ""
+    cols = ["hour", "local_hour", "label", "device", "gw", "checks", "failed", "slow", "router_p50", "router_p95",
+            "router_loss", "hop_p95", "net_p95", "rssi", "same_block", "lan", "version"]
+    import io
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, cols, extrasaction="ignore")
+    w.writeheader()
+    w.writerows(rows)
+    return buf.getvalue()
+
+
+BUILDING_CACHE = {"t": 0, "view": None}
+
+
+def building_view(d, days=7, max_age=600):
+    """Cached for 10 minutes: with ~100 apartments the hub returns a few thousand rows per call."""
+    if BUILDING_CACHE["view"] is not None and time.time() - BUILDING_CACHE["t"] < max_age:
+        return BUILDING_CACHE["view"]
+    view = _building_view(d, days)
+    if not view.get("error"):
+        BUILDING_CACHE.update(t=time.time(), view=view)
+    return view
+
+
+def _building_view(d, days):
+    cfg = load_config(d)
+    if not hub_of(cfg):
+        return {"configured": False}
+    try:
+        rows = building_rows(cfg, days)
+    except RuntimeError as e:
+        return {"configured": True, "error": str(e)}
     if not rows:
         return {"configured": True, "devices": [], "by_hour": [], "verdict": ["No apartment has shared data yet."]}
     gw = Counter(r["gw"] for r in rows).most_common(1)[0][0]
@@ -939,15 +986,17 @@ def building_view(d, days=14):
 
 def share_once(d):
     cfg = load_config(d)
-    if not (cfg["share"] and cfg["hub_url"] and cfg["building"]):
+    if not (cfg["share"] and hub_of(cfg)):
         return
-    payload = {"action": "ingest", "building": cfg["building"], "device": cfg["device_id"],
+    payload = {"action": "ingest", "device": cfg["device_id"],
                "label": cfg["label"][:20], "version": VERSION, "hours": hourly_summary(d)}
     SHARE_STATUS["last"] = now_iso()
     try:
-        res = curl_json(cfg["hub_url"], payload)
+        res = curl_json(hub_of(cfg), payload)
         SHARE_STATUS["ok"] = bool(res.get("ok"))
         SHARE_STATUS["msg"] = f"sent {len(payload['hours'])} hourly summaries" if res.get("ok") else res.get("error", "rejected")
+        if "too frequent" in SHARE_STATUS["msg"]:  # hub's per-device limit; the next round retries anyway
+            SHARE_STATUS["ok"], SHARE_STATUS["msg"] = None, "sent recently, next update within 30 minutes"
     except RuntimeError as e:
         SHARE_STATUS["ok"], SHARE_STATUS["msg"] = False, str(e)
 
@@ -1003,13 +1052,26 @@ def start_server(d, port):
                     self.send_response(500); self.end_headers(); self.wfile.write(str(e).encode()); return
             elif u.path == "/api/config":
                 cfg = load_config(d)
-                body, ctype = json.dumps({**cfg, "version": VERSION, "status": SHARE_STATUS}).encode(), "application/json"
+                body = json.dumps({**cfg, "version": VERSION, "status": SHARE_STATUS, "hub": bool(hub_of(cfg)),
+                                   "download_url": DOWNLOAD_URL}).encode()
+                ctype = "application/json"
             elif u.path == "/api/building":
                 try:
                     body = json.dumps(building_view(d), default=str).encode()
                 except RuntimeError as e:
                     body = json.dumps({"configured": True, "error": str(e)}).encode()
                 ctype = "application/json"
+            elif u.path == "/api/building.csv":
+                try:
+                    body = building_csv(d).encode()
+                except RuntimeError as e:
+                    self.send_response(502); self.end_headers(); self.wfile.write(str(e).encode()); return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header("Content-Disposition", 'attachment; filename="building-network-data.csv"')
+                self.end_headers()
+                self.wfile.write(body)
+                return
             elif u.path == "/":
                 body, ctype = page(live=True).encode(), "text/html; charset=utf-8"
             else:
@@ -1033,12 +1095,18 @@ def start_server(d, port):
             out = {"ok": True}
             if u == "/api/config":
                 cfg = load_config(d)
-                for k in ("share", "hub_url", "building", "label", "asked"):
-                    if k in data:
-                        cfg[k] = bool(data[k]) if k in ("share", "asked") else str(data[k]).strip()[:300]
+                was = cfg["share"]
+                if "share" in data:
+                    cfg["share"] = bool(data["share"])
+                if "label" in data:
+                    cfg["label"] = str(data["label"]).strip()[:20]
+                cfg["asked"] = True
                 save_config(d, cfg)
-                if cfg["share"]:
-                    threading.Thread(target=share_once, args=(d,), daemon=True).start()
+                if cfg["share"] and not was:
+                    def first_share():
+                        share_once(d)
+                        BUILDING_CACHE["t"] = 0  # show our own data in the building view right away
+                    threading.Thread(target=first_share, daemon=True).start()
             elif u == "/api/share-now":
                 share_once(d)
                 out = {"ok": bool(SHARE_STATUS["ok"]), "status": SHARE_STATUS}
@@ -1185,22 +1253,25 @@ a{color:var(--s1)}
   <label>Network <select id="gw"><option value="">All networks</option></select></label>
   <span class="pill" id="live"><span class="dot"></span>Live</span>
 </div>
-<div class="card" id="invite" hidden style="border-color:var(--s1)"><h2>Share with your building?</h2>
-<p class="sub">A neighbour set up a shared building view. If you agree, EMIL NetMon sends one anonymous summary per hour (how many checks failed or were slow, router delay, Wi-Fi signal strength, how crowded your channel is). Nothing else leaves your Mac: no website visits, no network names, no addresses. You can stop at any time below.</p>
-<button id="inv_yes">Share anonymous summaries</button> <button id="inv_no" class="ghost">No thanks</button></div>
+<div class="card" id="invite" hidden style="border-color:var(--s1)"><h2>Help get the building's internet fixed</h2>
+<p class="sub">Share anonymous stats with your neighbours, so the Building view can show whether everyone has the same problem at the same times. Once per hour EMIL NetMon sends how many checks failed or were slow, router delay, Wi-Fi signal strength and how crowded your channel is. No websites, network names or addresses. Everyone in the building can see these numbers.</p>
+<button class="sharebtn">Share anonymous stats</button> <button id="inv_no" class="ghost">Not now</button></div>
 <div id="body"></div>
 <div class="card" id="building" hidden><h2>Building view</h2><p class="sub" id="b_sub"></p><ul class="verdict" id="b_verdict"></ul>
 <h3>Problem rate by hour, all apartments</h3><svg id="b_hours"></svg>
 <h3>Problem rate by apartment and hour</h3><div class="scroll"><svg id="b_grid"></svg></div>
-<h3>Apartments</h3><div class="scroll"><table id="b_table"></table></div></div>
-<div class="card" id="settings" hidden><h2>Sharing and settings</h2>
-<div class="form"><label><input type="checkbox" id="c_share"> Share anonymous hourly summaries with the building view</label>
-<label>Hub URL <input id="c_hub" placeholder="https://script.google.com/macros/s/…/exec"></label>
-<label>Building code <input id="c_code" placeholder="shared code from whoever set up the hub"></label>
-<label>Apartment label (optional, shown to neighbours) <input id="c_label" maxlength="20" placeholder="e.g. 3B"></label>
-<div><button id="c_save">Save</button> <span class="note" id="c_status"></span></div></div>
-<div id="c_invite" hidden style="margin-top:14px"><h3>Invite neighbours</h3><p class="sub">Send this link in your building chat. It works for anyone who has installed EMIL NetMon: opening it fills in the hub and code, and asks them to confirm sharing.</p>
-<input id="c_link" readonly style="font:inherit;width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--line);background:var(--surface);color:var(--text)"> <button id="c_copy" class="ghost" style="margin-top:6px">Copy link</button></div>
+<h3>Apartments</h3><div class="scroll"><table id="b_table"></table></div>
+<p class="note" style="margin-top:10px"><a href="/api/building.csv">Download the building data (CSV)</a> to attach for building IT: one row per apartment and hour, last 30 days.</p></div>
+<div class="card" id="settings" hidden><h2>Sharing</h2>
+<div id="s_off"><p class="sub">Share anonymous stats with your neighbours for the Building view. Once per hour EMIL NetMon sends how many checks failed or were slow, router delay, Wi-Fi signal strength and how crowded your channel is. No websites, network names or addresses. Everyone in the building can see these numbers.</p>
+<button class="sharebtn">Share anonymous stats</button></div>
+<div id="s_on" hidden><p class="sub">You're sharing anonymous stats with the building. <span id="c_status"></span></p>
+<div class="form"><label>Apartment label (optional, shown to neighbours) <input id="c_label" maxlength="20" placeholder="e.g. 3B"></label>
+<div><button id="c_save" class="ghost">Save label</button> <button id="s_stop" class="ghost">Stop sharing</button></div></div></div>
+<p class="note" id="s_nohub" hidden>Sharing isn't set up in this copy of EMIL NetMon.</p>
+<div id="s_tell"><h3 style="margin-top:16px">Tell your neighbours</h3><p class="sub">The more apartments share, the stronger the evidence. Paste this into your building chat:</p>
+<textarea id="c_msg" readonly rows="6" style="font:inherit;font-size:13px;width:100%;max-width:640px;padding:8px;border-radius:6px;border:1px solid var(--line);background:var(--surface);color:var(--text)"></textarea>
+<div><button id="c_copy" class="ghost" style="margin-top:6px">Copy message</button></div></div>
 <p class="note" style="margin-top:14px">EMIL NetMon <span id="c_ver"></span> · data in ~/.netmon · <a href="#" id="c_uninstall">Stop monitoring and uninstall</a> (keeps your logs)</p></div>
 </main><div class="tip" id="tip"></div>
 <script>
@@ -1310,15 +1381,19 @@ function timeChart(svg,pts,lines,opts){svg.innerHTML="";const W=1000,H=opts.h||2
 async function refresh(){try{const q=new URLSearchParams({hours:$("hours").value,gw:$("gw").value});const r=await fetch("/api/data?"+q,{cache:"no-store"});if(!r.ok)throw new Error(r.status);D=await r.json();render();$("live").innerHTML='<span class="dot"></span>Live';}
  catch(e){$("live").innerHTML='<span class="dot" style="background:var(--crit)"></span>Reconnecting…'}}
 const post=(u,b)=>fetch(u,{method:"POST",headers:{"X-Netmon":"1","Content-Type":"application/json"},body:JSON.stringify(b||{})}).then(r=>r.json());
-const JOIN=(()=>{const q=new URLSearchParams(location.hash.slice(1));return q.get("hub")&&q.get("b")?{hub_url:q.get("hub"),building:q.get("b")}:null})();
-async function loadConfig(){try{const c=await (await fetch("/api/config")).json();
- if(JOIN&&(JOIN.hub_url!==c.hub_url||JOIN.building!==c.building||!c.share)){Object.assign(c,JOIN,{share:false,asked:false})}$("settings").hidden=false;$("c_ver").textContent=c.version;
- if(document.activeElement.tagName!=="INPUT"){$("c_share").checked=c.share;$("c_hub").value=c.hub_url||"";$("c_code").value=c.building||"";$("c_label").value=c.label||""}
- const st=c.status;$("c_status").textContent=c.share?(st.last?`Last sent ${new Date(st.last).toLocaleTimeString()}: ${st.msg}`:"Sharing on; first summary is sent within a few minutes"):"Sharing is off";
- $("invite").hidden=!(c.hub_url&&c.building&&!c.share&&!c.asked);
- $("c_invite").hidden=!(c.hub_url&&c.building);$("c_link").value=`${location.origin}/#hub=${encodeURIComponent(c.hub_url)}&b=${encodeURIComponent(c.building)}`;if(c.hub_url&&c.building)loadBuilding()}catch(e){}}
-async function saveConfig(extra){if(JOIN)history.replaceState(null,"",location.pathname);await post("/api/config",Object.assign({share:$("c_share").checked,hub_url:$("c_hub").value,building:$("c_code").value,label:$("c_label").value,asked:true},extra||{}));setTimeout(loadConfig,1500)}
-$("c_save").onclick=()=>saveConfig();$("c_copy").onclick=()=>{$("c_link").select();try{navigator.clipboard.writeText($("c_link").value)}catch(e){document.execCommand("copy")}$("c_copy").textContent="Copied"};$("inv_yes").onclick=()=>{$("c_share").checked=true;saveConfig({share:true})};$("inv_no").onclick=()=>saveConfig({share:false});
+let C=null,notNow=false;
+async function loadConfig(){try{const c=C=await (await fetch("/api/config")).json();$("settings").hidden=false;$("c_ver").textContent=c.version;
+ $("invite").hidden=!(c.hub&&!c.share&&!c.asked&&!notNow);$("s_off").hidden=!c.hub||c.share;$("s_on").hidden=!c.share;$("s_nohub").hidden=c.hub;$("s_tell").hidden=!c.hub;
+ if(document.activeElement.tagName!=="INPUT")$("c_label").value=c.label||"";
+ const st=c.status;$("c_status").textContent=st.last?`Last sent ${new Date(st.last).toLocaleTimeString()}: ${st.msg}.`:"The first summary goes out within a minute.";
+ $("c_msg").value=`Is the internet in our building dropping out for you too, especially in the evenings? I'm collecting evidence for building IT with EMIL NetMon, a free Mac app (macOS 12+) that measures where the connection breaks: Wi-Fi, router, building network or internet provider.\n\nDownload, unzip and open it, then click "Share anonymous stats": ${c.download_url}\n\nOnly anonymous hourly numbers are shared (failed checks, delays, Wi-Fi signal). No websites, network names or addresses.`;
+ if(c.hub)loadBuilding();else $("building").hidden=true}catch(e){}}
+async function saveConfig(b){await post("/api/config",b);await loadConfig();setTimeout(loadConfig,5000)}
+document.querySelectorAll(".sharebtn").forEach(x=>x.onclick=()=>saveConfig({share:true}));
+$("inv_no").onclick=()=>{notNow=true;$("invite").hidden=true;post("/api/config",{})};
+$("s_stop").onclick=()=>{if(confirm("Stop sharing? Summaries already sent stay in the Building view for up to 60 days."))saveConfig({share:false})};
+$("c_save").onclick=()=>saveConfig({label:$("c_label").value});
+$("c_copy").onclick=()=>{$("c_msg").select();try{navigator.clipboard.writeText($("c_msg").value)}catch(e){document.execCommand("copy")}$("c_copy").textContent="Copied"};
 $("c_uninstall").onclick=async e=>{e.preventDefault();if(!confirm("Stop netmon and remove it from login items? Your logs in ~/.netmon are kept."))return;await post("/api/uninstall");document.body.innerHTML='<main><h1>Monitoring stopped</h1><p class="sub">It no longer runs at login. Your logs are still in ~/.netmon. To start again, open the EMIL NetMon app.</p></main>'};
 let B=null;async function loadBuilding(){try{B=await (await fetch("/api/building")).json();renderBuilding()}catch(e){}}
 function renderBuilding(){const box=$("building");if(!B||!B.configured){box.hidden=true;return}box.hidden=false;

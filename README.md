@@ -11,8 +11,8 @@ ISP edge → internet → DNS → web) and shows a live dashboard at `http://127
 - **Wi-Fi context:** signal, tx rate, channel, roams, how many nearby networks share your channel,
   and how many devices share your local network.
 - **Security tunnels** (Netskope, Zscaler, …) are detected, so their hiccups aren't blamed on your ISP.
-- **Building view (optional):** neighbours can share anonymous hourly summaries to one Google Sheet,
-  and every dashboard shows whether all apartments see the same pattern.
+- **Building view (optional):** neighbours click **Share anonymous stats**, and every dashboard
+  shows whether all apartments see the same pattern.
 
 macOS 12+ only. A single Python file using only the standard library, plus a tiny Swift helper for Wi-Fi stats.
 
@@ -31,16 +31,19 @@ python3 netmon.py uninstall    # keeps logs in ~/.netmon
 
 ## Building view
 
-1. Set up the Google Sheet hub: [`hub/README.md`](hub/README.md) (about 5 minutes, no server needed).
-2. Enter the hub URL and building code under **Sharing and settings** in your dashboard.
-3. Copy the **invite link** from there and send it to neighbours who have installed the app.
-   The building code never has to be in the public download.
+Made for one building (about 100 apartments). Each neighbour installs the app and clicks
+**Share anonymous stats**. That's all. The app sends one anonymous summary per hour to the
+building's hub, and every dashboard shows the Building view with all apartments side by side.
+**Download the building data (CSV)** under the Building view gives a file to attach for building IT.
+
+The hub is a Google Sheet with a small Apps Script web app, deployed once by whoever publishes
+the app ([`hub/README.md`](hub/README.md)). Its URL goes into `DEFAULT_HUB` in `netmon.py`.
 
 ## Build the app
 
 ```bash
-./app/build_app.sh                                       # → dist/EMIL-NetMon.zip
-./app/build_app.sh --hub "<web app URL>" --building "<code>"   # private build with the hub pre-filled (don't publish this one)
+./app/build_app.sh                              # → dist/EMIL-NetMon.zip, uses DEFAULT_HUB
+./app/build_app.sh --hub "<web app URL>"        # same, but with another hub
 ```
 
 ## What it can and can't tell apart

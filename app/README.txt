@@ -21,10 +21,11 @@ INSTALL (Mac only, macOS 12 or newer)
    ("python3") was added. That's EMIL NetMon, so leave it switched on.
 
 SHARING WITH THE BUILDING (optional)
-If this copy was set up for your building, the dashboard asks whether to share.
-Only per-hour counts and timings are sent: failed/slow checks, router delay,
+Click "Share anonymous stats" in the dashboard. That's all. Your dashboard then
+also shows the Building view: every sharing apartment side by side.
+Only per-hour counts and timings are shared: failed/slow checks, router delay,
 Wi-Fi signal strength, how crowded your channel is. No websites, network
-names, addresses or personal data. Turn it off any time under "Sharing and settings".
+names, addresses or personal data. Click "Stop sharing" any time.
 
 STOP / UNINSTALL
 Click "Stop monitoring and uninstall" at the bottom of the dashboard.
