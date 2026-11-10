@@ -29,7 +29,8 @@ Version: New version → Deploy**. The URL stays the same.
 | Anyone with the app (the URL is in it) | Sends summaries and reads the Building view. |
 | Neighbours | Nothing is sent until they click **Share anonymous stats**; **Stop sharing** stops it. |
 
-What is sent, per complete hour: number of checks, failed and slow checks, router / next-hop /
+Only checks made on the building networks (EMIL BEWOHNER / EMIL GAST, recognised by their DHCP domain
+`emil.local` or the building router) are sent. What is sent, per complete hour: number of checks, failed and slow checks, router / next-hop /
 internet latency percentiles, router loss, median Wi-Fi signal, number of nearby networks on the
 same channel block, number of devices visible on the LAN, the local gateway IP (e.g. 192.168.1.1),
 a random device id and an optional label the neighbour types (e.g. "3B").

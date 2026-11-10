@@ -42,7 +42,7 @@ the data to send to building IT.
 ## Your privacy
 
 Nothing leaves your Mac until you click **Share anonymous stats**. After that, once per hour,
-it sends only numbers: how many checks failed or were slow, router delay, Wi-Fi signal strength,
+and only for time spent on the **EMIL BEWOHNER** or **EMIL GAST** Wi-Fi, it sends only numbers: how many checks failed or were slow, router delay, Wi-Fi signal strength,
 how crowded your Wi-Fi channel is, and an apartment label if you choose to add one.
 
 It never sends websites you visit, network names, addresses, names or email addresses.

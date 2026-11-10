@@ -43,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.7"
+VERSION = "0.8"
 APP_NAME = "EMIL NetMon"
 # The building's hub (hub/Code.gs on a Google Sheet). Everyone who clicks "Share anonymous stats"
 # sends to it; build_app.sh --hub can point a build somewhere else.
@@ -56,7 +56,12 @@ PLIST = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
 PORT = 8787
 
 PROBE_FIELDS = ["ts", "iface", "gateway", "wifi_if", "wifi_up", "rssi", "noise", "tx_rate", "channel",
-                "router_ms", "hop_ip", "hop_ms", "cf_ms", "goog_ms", "dns_ms", "dns_pub_ms", "dns_tcp_ms", "http_ms", "egress", "note"]
+                "router_ms", "hop_ip", "hop_ms", "cf_ms", "goog_ms", "dns_ms", "dns_pub_ms", "dns_tcp_ms", "http_ms", "egress", "lan_domain", "gw_mac", "note"]
+# Only checks made on the building's own networks (EMIL BEWOHNER / EMIL GAST) are shared. macOS hides
+# Wi-Fi names unless an app has Location access, so the networks are recognised by the DHCP domain they
+# hand out, or by the building router's MAC address. Neither is ever sent.
+BUILDING_DOMAINS = ("emil.local",)
+BUILDING_GW_MACS = ("02:1c:7f:0a:59:c8",)
 HTTP_URL = "https://www.gstatic.com/generate_204"
 DNS_NAME = "www.apple.com"
 WEAK_RSSI = -75
@@ -89,6 +94,27 @@ def sh(cmd, timeout):
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, OSError):
         return None
+
+
+def net_identity(iface, gw):
+    """(DHCP domain, gateway MAC) of the current network; both readable without any permission."""
+    dom = mac = ""
+    if iface:
+        r = sh(["/usr/sbin/ipconfig", "getoption", iface, "domain_name"], 3)
+        dom = r.stdout.strip().lower() if r and r.returncode == 0 else ""
+    if gw:
+        r = sh(["/usr/sbin/arp", "-n", gw], 3)
+        m = re.search(r" at ([0-9a-f:]+) ", r.stdout if r else "")
+        if m and m.group(1).count(":") == 5:
+            mac = ":".join(x.zfill(2) for x in m.group(1).split(":"))
+    return dom, mac
+
+
+def is_building_net(domain, gw_mac):
+    return bool(domain and any(domain == x or domain.endswith("." + x) for x in BUILDING_DOMAINS)) or gw_mac in BUILDING_GW_MACS
+
+
+CURRENT_NET = {"domain": "", "gw_mac": "", "building": None}
 
 
 def default_route():
@@ -366,14 +392,17 @@ def run(args):
             jobs = {"router_ms": lambda: router_probe(gw), "hop_ms": lambda: ping(hop),
                     "cf_ms": lambda: ping("1.1.1.1"), "goog_ms": lambda: ping("8.8.8.8"),
                     "dns_ms": dns, "dns_pub_ms": lambda: dns("1.1.1.1"), "dns_tcp_ms": lambda: dns("1.1.1.1", True),
-                    "http_ms": http, "_wifi": wifi.read}
+                    "http_ms": http, "_wifi": wifi.read, "_net": lambda: net_identity(iface, gw)}
             ths = [threading.Thread(target=lambda k=k, fn=fn: res.__setitem__(k, fn())) for k, fn in jobs.items()]
             for t in ths:
                 t.start()
             for t in ths:
                 t.join(8)
             wi = res.pop("_wifi", None) or {}
+            dom, mac = res.pop("_net", None) or ("", "")
+            CURRENT_NET.update(domain=dom, gw_mac=mac, building=is_building_net(dom, mac) if gw else None)
             row = {"ts": now_iso(), "iface": iface, "gateway": gw, "hop_ip": hop, "egress": egress, **res,
+                   "lan_domain": dom, "gw_mac": mac,
                    "wifi_if": wi.get("ifname", ""),
                    "wifi_up": "" if "up" not in wi else int(bool(wi["up"])),
                    "rssi": wi.get("rssi", "") if wi.get("up") else "",
@@ -430,7 +459,8 @@ def load_ticks(d):
                      "wifi_if": r.get("wifi_if") or "", "channel": r.get("channel") or "",
                      "wifi_up": {"1": True, "0": False}.get(r.get("wifi_up") or ""),
                      "router": fnum(r.get("router_ms") if "router_ms" in r else r.get("gw_ms")),
-                     "hop_ip": r.get("hop_ip") or "", "egress": r.get("egress") or ""}
+                     "hop_ip": r.get("hop_ip") or "", "egress": r.get("egress") or "",
+                     "building": is_building_net((r.get("lan_domain") or "").lower(), r.get("gw_mac") or "")}
                 t["tunnel"] = bool(TUNNEL_RE.search(t["egress"]))
                 t["v3"] = r.get("dns_pub_ms") is not None  # row has the public-DNS probes
                 t["v2"] = r.get("router_ms") is not None   # router probed with the TTL-1 method (not just ping)
@@ -830,7 +860,7 @@ def hourly_summary(d, hours=48):
     """Anonymous per-hour aggregates - the only thing ever sent to the building hub.
     No raw checks, no Wi-Fi names, no MAC addresses, no public IPs."""
     cutoff = datetime.now().astimezone() - timedelta(hours=hours)
-    ticks = [t for t in load_ticks(d) if not t["gap"] and t["ts"] >= cutoff and t["gateway"]]
+    ticks = [t for t in load_ticks(d) if not t["gap"] and t["ts"] >= cutoff and t["gateway"] and t["building"]]
     seen, answered = Counter(), Counter()
     for t in ticks:
         seen[t["gateway"]] += 1
@@ -1145,7 +1175,7 @@ def start_server(d, port):
                     self.send_response(500); self.end_headers(); self.wfile.write(str(e).encode()); return
             elif u.path == "/api/config":
                 cfg = load_config(d)
-                body = json.dumps({**cfg, "version": VERSION, "status": SHARE_STATUS, "hub": bool(hub_of(cfg)), "update": UPDATE,
+                body = json.dumps({**cfg, "version": VERSION, "status": SHARE_STATUS, "hub": bool(hub_of(cfg)), "update": UPDATE, "on_building_net": CURRENT_NET["building"],
                                    "download_url": DOWNLOAD_URL}).encode()
                 ctype = "application/json"
             elif u.path == "/api/building":
@@ -1365,7 +1395,7 @@ a{color:var(--s1)}
 <div class="card" id="upd" hidden style="border-color:var(--s1)"><h2 id="upd_title"></h2><p class="sub" id="upd_notes"></p>
 <button id="upd_go">Update now</button> <span class="note" id="upd_msg"></span></div>
 <div class="card" id="invite" hidden style="border-color:var(--s1)"><h2>Help get the building's internet fixed</h2>
-<p class="sub">Share anonymous stats with your neighbours, so the Building view can show whether everyone has the same problem at the same times. Once per hour EMIL NetMon sends how many checks failed or were slow, router delay, Wi-Fi signal strength and how crowded your channel is. No websites, network names or addresses. Everyone in the building can see these numbers.</p>
+<p class="sub">Share anonymous stats with your neighbours, so the Building view can show whether everyone has the same problem at the same times. While you're on EMIL BEWOHNER or EMIL GAST, EMIL NetMon sends once per hour how many checks failed or were slow, router delay, Wi-Fi signal strength and how crowded your channel is. No websites, network names or addresses. Everyone in the building can see these numbers.</p>
 <button class="sharebtn">Share anonymous stats</button> <button id="inv_no" class="ghost">Not now</button></div>
 <div id="body"></div>
 <div class="card" id="building" hidden><h2>Building view</h2><p class="sub" id="b_sub"></p><ul class="verdict" id="b_verdict"></ul>
@@ -1374,9 +1404,10 @@ a{color:var(--s1)}
 <h3>Apartments</h3><div class="scroll"><table id="b_table"></table></div>
 <p class="note" style="margin-top:10px"><a href="/api/building.csv">Download the building data (CSV)</a> to attach for building IT: one row per apartment and hour, last 30 days.</p></div>
 <div class="card" id="settings" hidden><h2>Sharing</h2>
-<div id="s_off"><p class="sub">Share anonymous stats with your neighbours for the Building view. Once per hour EMIL NetMon sends how many checks failed or were slow, router delay, Wi-Fi signal strength and how crowded your channel is. No websites, network names or addresses. Everyone in the building can see these numbers.</p>
+<div id="s_off"><p class="sub">Share anonymous stats with your neighbours for the Building view. While you're on EMIL BEWOHNER or EMIL GAST, EMIL NetMon sends once per hour how many checks failed or were slow, router delay, Wi-Fi signal strength and how crowded your channel is. No websites, network names or addresses. Everyone in the building can see these numbers.</p>
 <button class="sharebtn">Share anonymous stats</button></div>
 <div id="s_on" hidden><p class="sub">You're sharing anonymous stats with the building. <span id="c_status"></span></p>
+<p class="note" id="s_net"></p>
 <div class="form"><label>Apartment label (optional, shown to neighbours) <input id="c_label" maxlength="20" placeholder="e.g. 3B"></label>
 <div><button id="c_save" class="ghost">Save label</button> <button id="s_stop" class="ghost">Stop sharing</button></div></div></div>
 <p class="note" id="s_nohub" hidden>Sharing isn't set up in this copy of EMIL NetMon.</p>
@@ -1500,7 +1531,8 @@ async function loadConfig(){try{const c=C=await (await fetch("/api/config")).jso
  if(u.state==="error"){updating=null;$("upd_go").disabled=false;$("upd_msg").textContent=u.msg}else if(updating)$("upd_msg").textContent=u.msg||"Updating…";
  $("invite").hidden=!(c.hub&&!c.share&&!c.asked&&!notNow);$("s_off").hidden=!c.hub||c.share;$("s_on").hidden=!c.share;$("s_nohub").hidden=c.hub;$("s_tell").hidden=!c.hub;
  if(document.activeElement.tagName!=="INPUT")$("c_label").value=c.label||"";
- const st=c.status;$("c_status").textContent=st.last?`Last sent ${new Date(st.last).toLocaleTimeString()}: ${st.msg}.`:"The first summary goes out within a minute.";
+ const st=c.status;$("s_net").textContent=c.on_building_net===false?"You're not on an EMIL network right now, so nothing from this network is shared. Only checks made on EMIL BEWOHNER or EMIL GAST count.":c.on_building_net?"You're on an EMIL network: these checks count for the building.":"";
+ $("c_status").textContent=st.last?`Last sent ${new Date(st.last).toLocaleTimeString()}: ${st.msg}.`:"The first summary goes out within a minute.";
  $("c_msg").value=`Is the internet in our building dropping out for you too, especially in the evenings? I'm collecting evidence for building IT with EMIL NetMon, a free Mac app (macOS 12+) that measures where the connection breaks: Wi-Fi, router, building network or internet provider.\n\nDownload, unzip and open it, then click "Share anonymous stats": ${c.download_url}\n\nOnly anonymous hourly numbers are shared (failed checks, delays, Wi-Fi signal). No websites, network names or addresses.`;
  if(c.hub)loadBuilding();else $("building").hidden=true}catch(e){}}
 async function saveConfig(b){await post("/api/config",b);await loadConfig();setTimeout(loadConfig,5000)}
