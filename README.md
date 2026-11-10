@@ -1,54 +1,65 @@
 # EMIL NetMon
 
-See what's actually wrong with a flaky internet connection, and collect evidence you can show
-whoever runs the network.
+**Does the internet in our building keep dropping out, especially in the evenings?**
 
-EMIL NetMon checks every link of the chain every 10 seconds (Wi-Fi radio → router → next hop /
-ISP edge → internet → DNS → web) and shows a live dashboard at `http://127.0.0.1:8787`:
+EMIL NetMon is a free Mac app that quietly checks your connection every 10 seconds and shows you
+*where* it breaks: your Wi-Fi, the router, the building network, or the internet provider.
+Together with your neighbours, it collects the evidence building IT needs to fix it.
 
-- **Where it breaks:** each outage is blamed on the lowest link that failed while everything above it failed too.
-- **When it happens:** failed or slow checks by day and hour, plus evenings compared with the rest of the day.
-- **Wi-Fi context:** signal, tx rate, channel, roams, how many nearby networks share your channel,
-  and how many devices share your local network.
-- **Security tunnels** (Netskope, Zscaler, …) are detected, so their hiccups aren't blamed on your ISP.
-- **Building view (optional):** neighbours click **Share anonymous stats**, and every dashboard
-  shows whether all apartments see the same pattern.
+### ⬇️ [Download EMIL NetMon for Mac](https://github.com/chris-boson/emil-netmon/releases/latest/download/EMIL-NetMon.zip)
 
-macOS 12+ only. A single Python file using only the standard library, plus a tiny Swift helper for Wi-Fi stats.
+Free · macOS 12 or newer · no account needed
 
-## Install
+![EMIL NetMon dashboard: uptime, outages, Wi-Fi signal and a plain-English summary of what's going on](docs/screenshots/overview.png)
 
-**App:** download `EMIL-NetMon.zip` from [Releases](../../releases), unzip, and open `EMIL NetMon.app`.
-It isn't signed by Apple, so the first launch needs **System Settings → Privacy & Security → Open Anyway**.
-See [`app/README.txt`](app/README.txt).
+## Get started in 2 minutes
 
-**From source:**
-```bash
-python3 netmon.py install      # runs in the background at login, dashboard on http://127.0.0.1:8787
-python3 netmon.py report --open
-python3 netmon.py uninstall    # keeps logs in ~/.netmon
-```
+1. **Download** the app above, unzip it, and move **EMIL NetMon** to your Applications folder.
+2. **Open it.** The first time, macOS says it "cannot verify" the app, because it isn't from the
+   App Store. Click **Done**, then open **System Settings → Privacy & Security**, scroll down and
+   click **Open Anyway**.
+   If you're asked to install "Command Line Tools", click **Install**, wait until it's done, and open the app again.
+3. Your dashboard opens in the browser. Click **Share anonymous stats**. That's it.
 
-## Building view
+![The "Share anonymous stats" button](docs/screenshots/share.png)
 
-Made for one building (about 100 apartments). Each neighbour installs the app and clicks
-**Share anonymous stats**. That's all. The app sends one anonymous summary per hour to the
-building's hub, and every dashboard shows the Building view with all apartments side by side.
-**Download the building data (CSV)** under the Building view gives a file to attach for building IT.
+EMIL NetMon keeps running in the background, also after restarts. Open the app again any time to get back to your dashboard.
 
-The hub is a Google Sheet with a small Apps Script web app, deployed once by whoever publishes
-the app ([`hub/README.md`](hub/README.md)). Its URL goes into `DEFAULT_HUB` in `netmon.py`.
+## What you'll see
 
-## Build the app
+**When it happens.** Problems by day and hour, so you can see the evening pattern for yourself.
 
-```bash
-./app/build_app.sh                              # → dist/EMIL-NetMon.zip, uses DEFAULT_HUB
-./app/build_app.sh --hub "<web app URL>"        # same, but with another hub
-```
+![Problems by day and hour, peaking between 18:00 and 22:00](docs/screenshots/when.png)
 
-## What it can and can't tell apart
+**The whole building.** Every apartment that shares appears side by side. If everyone has the
+same problem at the same time, it's the building network, not your laptop. One click downloads
+the data to send to building IT.
 
-From one wireless laptop, the access point and the router behind it look like a single hop. To prove
-a Wi-Fi problem, compare against an Ethernet connection. Routers answer the "TTL expired" probe from
-their control plane, so a slow router reply with fast internet is not by itself a problem; the
-dashboard only blames the local network when the internet is slow as well.
+![Building view: problem rate by hour and by apartment](docs/screenshots/building.png)
+
+<sub>Screenshots show example data.</sub>
+
+## Your privacy
+
+Nothing leaves your Mac until you click **Share anonymous stats**. After that, once per hour,
+it sends only numbers: how many checks failed or were slow, router delay, Wi-Fi signal strength,
+how crowded your Wi-Fi channel is, and an apartment label if you choose to add one.
+
+It never sends websites you visit, network names, addresses, names or email addresses.
+Everyone in the building can see the shared numbers. Click **Stop sharing** at any time.
+
+## Stop or uninstall
+
+Click **Stop monitoring and uninstall** at the bottom of the dashboard. Your logs stay in the
+hidden folder `~/.netmon`; delete it to remove everything.
+
+## Questions
+
+- **Does it slow down my internet?** No. Each check is a few tiny test messages.
+- **Windows, iPhone or Android?** Sorry, Mac only for now.
+- **Why the "Open Anyway" step?** Apple charges developers to sign apps. EMIL NetMon is a free
+  neighbourhood project, and all its code is public in this repository.
+
+---
+
+Curious how it works, or want to run it from source? See [docs/technical.md](docs/technical.md).
