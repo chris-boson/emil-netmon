@@ -25,13 +25,16 @@ Data lives in ~/.netmon (override with --data-dir or NETMON_DIR).
 import argparse
 import bisect
 import csv
+import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
@@ -40,12 +43,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.6"
+VERSION = "0.7"
 APP_NAME = "EMIL NetMon"
 # The building's hub (hub/Code.gs on a Google Sheet). Everyone who clicks "Share anonymous stats"
 # sends to it; build_app.sh --hub can point a build somewhere else.
 DEFAULT_HUB = "https://script.google.com/macros/s/AKfycbw9om_qfZW06Ncd7DZRw2D_WpF8JmlimX7S_N0BXi3ZOUinERiqL7oDgc-1XEksTtPXoA/exec"
-DOWNLOAD_URL = "https://github.com/chris-boson/emil-netmon/releases/latest/download/EMIL-NetMon.zip"
+RELEASES = "https://github.com/chris-boson/emil-netmon/releases/latest/download"  # serves EMIL-NetMon.zip + latest.json
+DOWNLOAD_URL = f"{RELEASES}/EMIL-NetMon.zip"
 DEFAULT_DIR = Path(os.environ.get("NETMON_DIR", Path.home() / ".netmon"))
 LABEL = "com.netmon.agent"
 PLIST = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
@@ -316,6 +320,7 @@ def run(args):
     if args.port:
         start_server(d, args.port)
     threading.Thread(target=share_loop, args=(d, stop), daemon=True).start()
+    threading.Thread(target=update_loop, args=(d, stop), daemon=True).start()
 
     state = {"gw": None, "hop": "", "hop_at": 0, "egress": ""}
     hop_lock = threading.Lock()
@@ -687,8 +692,12 @@ def analyze(d, hours=None, gateway=None, min_ticks=2):
         elif isp_s >= 0.6 * down:
             verdict.append(f"{100 * isp_s / down:.0f}% of downtime is beyond your router: the router answered while the line out of it did not. "
                            "This is the pattern to show your ISP.")
+        elif down - local_s - isp_s >= 0.6 * down:
+            verdict.append(f"{100 * (down - local_s - isp_s) / down:.0f}% of downtime was DNS or web only: the network itself was up, "
+                           "but name lookups or web pages failed.")
         else:
-            verdict.append(f"Downtime is split: {100 * local_s / down:.0f}% local (Wi-Fi/LAN), {100 * isp_s / down:.0f}% beyond the router.")
+            verdict.append(f"Downtime is split: {100 * local_s / down:.0f}% local (Wi-Fi/LAN), {100 * isp_s / down:.0f}% beyond the router, "
+                           f"{100 * (down - local_s - isp_s) / down:.0f}% DNS or web only.")
         if ld["wifi_weak"] + ld["wifi_link"] > 0.3 * down:
             verdict.append("Many outages coincide with a dropped Wi-Fi link or weak signal, so the radio link itself is a prime suspect.")
         if ld["local"] > 0.3 * down:
@@ -1011,6 +1020,90 @@ def share_loop(d, stop, every=1800):
         stop.wait(every)
 
 
+# =========================================================================== updates
+UPDATE = {"latest": None, "notes": "", "sha256": "", "state": "", "msg": ""}
+
+
+def vtuple(v):
+    try:
+        return tuple(int(x) for x in str(v).strip().lstrip("v").split("."))
+    except ValueError:
+        return (0,)
+
+
+def releases_url(d):
+    return load_config(d).get("release_url") or RELEASES  # override only for testing
+
+
+def check_update(d):
+    """Reads latest.json from the newest GitHub release (a plain download, so no API rate limits)."""
+    try:
+        info = curl_json(f"{releases_url(d)}/latest.json")
+    except RuntimeError:
+        return
+    if vtuple(info.get("version")) > vtuple(VERSION):
+        UPDATE.update(latest=str(info["version"]), notes=str(info.get("notes", ""))[:500], sha256=str(info.get("sha256", "")))
+    else:
+        UPDATE["latest"] = None
+
+
+def update_loop(d, stop):
+    stop.wait(random.uniform(60, 900))  # spread the building's Macs out
+    while not stop.is_set():
+        try:
+            check_update(d)
+        except Exception:
+            pass
+        stop.wait(86400 + random.uniform(0, 3600))
+
+
+def app_location(d):
+    """The EMIL NetMon.app the launcher last ran from (it writes ~/.netmon/app_path)."""
+    try:
+        p = Path((d / "app_path").read_text().strip())
+    except OSError:
+        return None
+    return p if p.suffix == ".app" and (p / "Contents" / "Resources").is_dir() and os.access(p, os.W_OK) else None
+
+
+def apply_update(d):
+    """Downloads the newest app, swaps it in for the installed one and restarts the background agent.
+    Runs only when the user clicks "Update now"."""
+    if UPDATE["state"] == "working":
+        return
+    UPDATE.update(state="working", msg="Downloading the new version…")
+    try:
+        tmp = Path(tempfile.mkdtemp(prefix="emil-netmon-update-"))
+        z = tmp / "EMIL-NetMon.zip"
+        r = subprocess.run(["/usr/bin/curl", "-sfL", "-m", "300", "-o", str(z), f"{releases_url(d)}/EMIL-NetMon.zip"], capture_output=True)
+        if r.returncode != 0:
+            raise RuntimeError("the download failed. Check your connection and try again.")
+        if UPDATE["sha256"] and hashlib.sha256(z.read_bytes()).hexdigest() != UPDATE["sha256"]:
+            raise RuntimeError("the download was damaged. Try again later.")
+        subprocess.run(["/usr/bin/ditto", "-x", "-k", str(z), str(tmp / "x")], check=True, capture_output=True)
+        new = next(iter(sorted((tmp / "x").glob("**/*.app"))), None)
+        if not new or not (new / "Contents/Resources/netmon.py").exists():
+            raise RuntimeError("the download doesn't contain the app.")
+        ver = subprocess.run([sys.executable, str(new / "Contents/Resources/netmon.py"), "version"],
+                             capture_output=True, text=True, timeout=30).stdout.strip()
+        if vtuple(ver) <= vtuple(VERSION):
+            raise RuntimeError("the download isn't newer than this version.")
+        app = app_location(d)
+        if app:  # update the app in place (works without admin rights: the user owns the bundle)
+            UPDATE["msg"] = "Installing…"
+            r = subprocess.run(["/usr/bin/rsync", "-a", "--delete", f"{new}/", f"{app}/"], capture_output=True, text=True)
+            if r.returncode != 0:
+                app = None  # couldn't replace the app; the background monitor still gets updated below
+        src = (app or new) / "Contents/Resources/netmon.py"
+        UPDATE["msg"] = "Restarting…"
+        # new session, so the restart (which stops this very process) can finish
+        with open(d / "update.log", "w") as log:
+            subprocess.Popen([sys.executable, str(src), "--data-dir", str(d), "install"],
+                             start_new_session=True, stdout=log, stderr=subprocess.STDOUT)
+    except Exception as e:
+        UPDATE.update(state="error", msg=f"Update failed: {e}")
+
+
 # =========================================================================== report / server
 def page(data=None, live=False):
     return (TEMPLATE.replace("/*DATA*/null", json.dumps(data, default=str) if data else "null")
@@ -1052,7 +1145,7 @@ def start_server(d, port):
                     self.send_response(500); self.end_headers(); self.wfile.write(str(e).encode()); return
             elif u.path == "/api/config":
                 cfg = load_config(d)
-                body = json.dumps({**cfg, "version": VERSION, "status": SHARE_STATUS, "hub": bool(hub_of(cfg)),
+                body = json.dumps({**cfg, "version": VERSION, "status": SHARE_STATUS, "hub": bool(hub_of(cfg)), "update": UPDATE,
                                    "download_url": DOWNLOAD_URL}).encode()
                 ctype = "application/json"
             elif u.path == "/api/building":
@@ -1107,6 +1200,11 @@ def start_server(d, port):
                         share_once(d)
                         BUILDING_CACHE["t"] = 0  # show our own data in the building view right away
                     threading.Thread(target=first_share, daemon=True).start()
+            elif u == "/api/update":
+                threading.Thread(target=apply_update, args=(d,), daemon=True).start()
+            elif u == "/api/check-update":
+                check_update(d)
+                out = {"ok": True, "update": UPDATE}
             elif u == "/api/share-now":
                 share_once(d)
                 out = {"ok": bool(SHARE_STATUS["ok"]), "status": SHARE_STATUS}
@@ -1138,6 +1236,10 @@ def install(args):
     d.mkdir(parents=True, exist_ok=True)
     target = d / "netmon.py"
     if Path(__file__).resolve() != target.resolve():
+        m = target.exists() and re.search(r'^VERSION = "([0-9.]+)"', target.read_text(errors="ignore"), re.M)
+        if m and vtuple(m.group(1)) > vtuple(VERSION) and not args.force:
+            print(f"A newer version ({m.group(1)}) is already installed; keeping it (use --force to replace).")
+            return install_existing(args, target)
         shutil.copy2(__file__, target)
     here = Path(__file__).resolve().parent
     for extra in ("wifistat", "defaults.json"):  # shipped inside Netmon.app
@@ -1177,6 +1279,12 @@ def install(args):
     print(f"Installed: runs at login, logs to {d}\nLive dashboard: http://127.0.0.1:{args.port}")
 
 
+def install_existing(args, target):
+    r = subprocess.run([sys.executable, str(target), "--data-dir", str(args.data_dir), "install",
+                        "--interval", str(args.interval), "--port", str(args.port)])
+    sys.exit(r.returncode)
+
+
 def uninstall(args):
     if PLIST.exists():  # remove first: bootout may stop this very process
         PLIST.unlink()
@@ -1201,6 +1309,7 @@ def main():
     i = sub.add_parser("install", help="run in the background via launchd")
     i.add_argument("--interval", type=int, default=10)
     i.add_argument("--port", type=int, default=PORT)
+    i.add_argument("--force", action="store_true", help="replace a newer installed version")
     sub.add_parser("uninstall")
     sub.add_parser("version")
     args = p.parse_args()
@@ -1253,6 +1362,8 @@ a{color:var(--s1)}
   <label>Network <select id="gw"><option value="">All networks</option></select></label>
   <span class="pill" id="live"><span class="dot"></span>Live</span>
 </div>
+<div class="card" id="upd" hidden style="border-color:var(--s1)"><h2 id="upd_title"></h2><p class="sub" id="upd_notes"></p>
+<button id="upd_go">Update now</button> <span class="note" id="upd_msg"></span></div>
 <div class="card" id="invite" hidden style="border-color:var(--s1)"><h2>Help get the building's internet fixed</h2>
 <p class="sub">Share anonymous stats with your neighbours, so the Building view can show whether everyone has the same problem at the same times. Once per hour EMIL NetMon sends how many checks failed or were slow, router delay, Wi-Fi signal strength and how crowded your channel is. No websites, network names or addresses. Everyone in the building can see these numbers.</p>
 <button class="sharebtn">Share anonymous stats</button> <button id="inv_no" class="ghost">Not now</button></div>
@@ -1382,7 +1493,11 @@ async function refresh(){try{const q=new URLSearchParams({hours:$("hours").value
  catch(e){$("live").innerHTML='<span class="dot" style="background:var(--crit)"></span>Reconnecting…'}}
 const post=(u,b)=>fetch(u,{method:"POST",headers:{"X-Netmon":"1","Content-Type":"application/json"},body:JSON.stringify(b||{})}).then(r=>r.json());
 let C=null,notNow=false;
+let updating=null;
 async function loadConfig(){try{const c=C=await (await fetch("/api/config")).json();$("settings").hidden=false;$("c_ver").textContent=c.version;
+ if(updating&&c.version!==updating){location.reload();return}
+ const u=c.update||{};$("upd").hidden=!(u.latest||updating);if(u.latest){$("upd_title").textContent=`Update available: EMIL NetMon ${u.latest}`;$("upd_notes").textContent=(u.notes?u.notes+" ":"")+`You have ${c.version}. Your data and settings are kept.`}
+ if(u.state==="error"){updating=null;$("upd_go").disabled=false;$("upd_msg").textContent=u.msg}else if(updating)$("upd_msg").textContent=u.msg||"Updating…";
  $("invite").hidden=!(c.hub&&!c.share&&!c.asked&&!notNow);$("s_off").hidden=!c.hub||c.share;$("s_on").hidden=!c.share;$("s_nohub").hidden=c.hub;$("s_tell").hidden=!c.hub;
  if(document.activeElement.tagName!=="INPUT")$("c_label").value=c.label||"";
  const st=c.status;$("c_status").textContent=st.last?`Last sent ${new Date(st.last).toLocaleTimeString()}: ${st.msg}.`:"The first summary goes out within a minute.";
@@ -1393,6 +1508,8 @@ document.querySelectorAll(".sharebtn").forEach(x=>x.onclick=()=>saveConfig({shar
 $("inv_no").onclick=()=>{notNow=true;$("invite").hidden=true;post("/api/config",{})};
 $("s_stop").onclick=()=>{if(confirm("Stop sharing? Summaries already sent stay in the Building view for up to 60 days."))saveConfig({share:false})};
 $("c_save").onclick=()=>saveConfig({label:$("c_label").value});
+$("upd_go").onclick=async()=>{updating=C.version;$("upd_go").disabled=true;$("upd_msg").textContent="Updating…";await post("/api/update");
+ const t=setInterval(async()=>{if(!updating){clearInterval(t);return}await loadConfig()},2000);setTimeout(()=>{if(updating){clearInterval(t);$("upd_msg").textContent="This is taking long. Open EMIL NetMon again from Applications."}},120000)};
 $("c_copy").onclick=()=>{$("c_msg").select();try{navigator.clipboard.writeText($("c_msg").value)}catch(e){document.execCommand("copy")}$("c_copy").textContent="Copied"};
 $("c_uninstall").onclick=async e=>{e.preventDefault();if(!confirm("Stop netmon and remove it from login items? Your logs in ~/.netmon are kept."))return;await post("/api/uninstall");document.body.innerHTML='<main><h1>Monitoring stopped</h1><p class="sub">It no longer runs at login. Your logs are still in ~/.netmon. To start again, open the EMIL NetMon app.</p></main>'};
 let B=null;async function loadBuilding(){try{B=await (await fetch("/api/building")).json();renderBuilding()}catch(e){}}

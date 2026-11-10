@@ -42,6 +42,21 @@ The app bundles `netmon.py`, a universal (Apple Silicon + Intel) Wi-Fi helper an
 ad-hoc signed, so the first launch needs **Open Anyway**. The launcher uses the system Python from
 Apple's Command Line Tools (or Homebrew's) and installs or updates the background agent.
 
+## Releases and updates
+
+Running apps read `latest.json` from the newest GitHub release once a day and show **Update now**
+when it lists a higher version. The click downloads `EMIL-NetMon.zip`, checks its SHA-256 against
+`latest.json`, replaces the app the launcher last ran from (`~/.netmon/app_path`) and restarts the
+background agent. Nothing updates without that click. Neither the launcher nor `install` ever replaces
+a newer installed version with an older one.
+
+To publish a release, bump `VERSION` in `netmon.py`, then:
+
+```bash
+./app/build_app.sh --notes "What's new, in one sentence"
+gh release create vX.Y dist/EMIL-NetMon.zip dist/latest.json --title "EMIL NetMon X.Y" --notes "..."
+```
+
 ## What it can and can't tell apart
 
 From one wireless laptop, the access point and the router behind it look like a single hop. To prove

@@ -26,12 +26,21 @@ A macOS window offering to install them should have opened. Click Install, wait 
   fi
 fi
 
+mkdir -p "$DATA"
+APP="$(cd "$RES/../.." && pwd)"
+echo "$APP" > "$DATA/app_path"   # lets "Update now" in the dashboard update this copy of the app
+
 BUNDLED=$("$PY" "$RES/netmon.py" version 2>/dev/null)
 INSTALLED=$("$PY" "$DATA/netmon.py" version 2>/dev/null)
-FIRST=""
-if [ "$BUNDLED" != "$INSTALLED" ] || ! /bin/launchctl print "gui/$(id -u)/com.netmon.agent" >/dev/null 2>&1; then
-  [ -z "$INSTALLED" ] && FIRST=1
-  if ! OUT=$("$PY" "$RES/netmon.py" install 2>&1); then
+newer() { "$PY" -c 'import sys; t=lambda v: tuple(int(x) for x in v.split(".")); sys.exit(0 if t(sys.argv[1]) > t(sys.argv[2]) else 1)' "$1" "$2" 2>/dev/null; }
+RUNNING=""; /bin/launchctl print "gui/$(id -u)/com.netmon.agent" >/dev/null 2>&1 && RUNNING=1
+FIRST=""; SRC=""
+if [ -z "$INSTALLED" ]; then FIRST=1; SRC="$RES/netmon.py"
+elif newer "$BUNDLED" "$INSTALLED"; then SRC="$RES/netmon.py"     # this app is newer: update
+elif [ -z "$RUNNING" ]; then SRC="$DATA/netmon.py"                # not running: restart what's installed (never downgrade)
+fi
+if [ -n "$SRC" ]; then
+  if ! OUT=$("$PY" "$SRC" install 2>&1); then
     say "EMIL NetMon could not start:
 
 $OUT"

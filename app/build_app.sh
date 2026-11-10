@@ -3,12 +3,14 @@
 #
 #   ./app/build_app.sh                          # uses DEFAULT_HUB from netmon.py
 #   ./app/build_app.sh --hub "<web app URL>"    # app that uses your own hub instead
+#   ./app/build_app.sh --notes "What's new"     # text shown in the dashboard's update banner
 set -euo pipefail
 cd "$(dirname "$0")/.."
-HUB=""
+HUB="" NOTES=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --hub) HUB="$2"; shift 2 ;;
+    --notes) NOTES="$2"; shift 2 ;;
     *) echo "unknown option $1"; exit 1 ;;
   esac
 done
@@ -55,5 +57,8 @@ codesign --verify --deep "$APP"
 
 # 4. Zip for sharing
 ditto -c -k --keepParent "$DIST/$NAME" "$DIST/EMIL-NetMon.zip"
+# 5. latest.json: what running apps read to offer "Update now" (upload it with the zip to every release)
+python3 -c 'import hashlib,json,sys; print(json.dumps({"version": sys.argv[1], "notes": sys.argv[2], "sha256": hashlib.sha256(open(sys.argv[3],"rb").read()).hexdigest()}))' \
+  "$VERSION" "$NOTES" "$DIST/EMIL-NetMon.zip" > "$DIST/latest.json"
 echo "Built $APP (v$VERSION)$( [ -n "$HUB" ] && echo ", own hub")"
-echo "Share: $DIST/EMIL-NetMon.zip"
+echo "Release: upload $DIST/EMIL-NetMon.zip and $DIST/latest.json"
