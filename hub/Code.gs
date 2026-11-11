@@ -13,7 +13,7 @@ const MAX_ROWS = 250000;           // safety cap (~100 apartments x 24 h x 60 da
 
 const COLS = ['received', 'device', 'label', 'version', 'epoch', 'hour', 'local_hour', 'gw', 'checks', 'failed',
               'slow', 'router_p50', 'router_p95', 'router_loss', 'hop_p95', 'net_p95', 'rssi', 'same_block', 'lan',
-              // since 0.9: which rung failed, what was slow, failed checks per 5 minutes ("." = none)
+              // since 0.9: which rung failed, what was slow, failed checks per 5 minutes ("_" = none)
               'f_wifi', 'f_router', 'f_uplink', 'f_internet', 'f_dns', 'f_web', 's_router', 's_net', 's_web', 'slots'];
 const INDEX_ROWS = 50000;          // re-sent hours are always among the newest rows
 const OUT = COLS.filter(c => c !== 'received' && c !== 'hour');  // what dashboards get back
@@ -34,6 +34,11 @@ function sheet_() {
     sh.getRange(1, 1, 1, COLS.length).setValues([COLS]);  // columns added by a newer version
   }
   return sh;
+}
+
+// keep labels like "504" or "03" and the slots string as text, not numbers
+function text_(sh, row, n) {
+  ['device', 'label', 'gw', 'slots'].forEach(c => sh.getRange(row, C[c] + 1, n, 1).setNumberFormat('@'));
 }
 
 function num_(v, lo, hi) {
@@ -80,12 +85,16 @@ function doPost(e) {
                    num_(h.same_block, 0, 200), num_(h.lan, 0, 5000),
                    num_(h.f_wifi, 0, 1000), num_(h.f_router, 0, 1000), num_(h.f_uplink, 0, 1000), num_(h.f_internet, 0, 1000),
                    num_(h.f_dns, 0, 1000), num_(h.f_web, 0, 1000), num_(h.s_router, 0, 1000), num_(h.s_net, 0, 1000),
-                   num_(h.s_web, 0, 1000), /^[.1-9]{12}$/.test(h.slots || '') ? h.slots : ''];
+                   num_(h.s_web, 0, 1000), /^[_.1-9]{12}$/.test(h.slots || '') ? h.slots : ''];
       const at = index[row[C.epoch] + '|' + gw];
-      if (at) sh.getRange(at, 1, 1, COLS.length).setValues([row]);
+      if (at) { text_(sh, at, 1); sh.getRange(at, 1, 1, COLS.length).setValues([row]); }
       else append.push(row);
     });
-    if (append.length) sh.getRange(sh.getLastRow() + 1, 1, append.length, COLS.length).setValues(append);
+    if (append.length) {
+      const start = sh.getLastRow() + 1;
+      text_(sh, start, append.length);
+      sh.getRange(start, 1, append.length, COLS.length).setValues(append);
+    }
     props.setProperty(lastKey, String(now));
     if (now - Number(props.getProperty('pruned') || 0) > 86400000) {  // once a day
       prune_(sh, props);

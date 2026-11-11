@@ -33,7 +33,7 @@ themselves. Apps keep working with an older script, they just can't show what fa
 Only checks made on the building networks (EMIL BEWOHNER / EMIL GAST, recognised by their DHCP domain
 `emil.local` or the building router) are sent. What is sent, per complete hour: number of checks, failed and slow checks, which rung the failed
 checks broke at (Wi-Fi, router, building uplink, internet, DNS, web) and which the slow ones were slow
-at, failed checks per 5 minutes (column `slots`, `.` = none), router / next-hop /
+at, failed checks per 5 minutes (column `slots`, `_` = none), router / next-hop /
 internet latency percentiles, router loss, median Wi-Fi signal, number of nearby networks on the
 same channel block, number of devices visible on the LAN, the local gateway IP (e.g. 192.168.1.1),
 a random device id and the apartment number the neighbour types (e.g. "3B"). An hour that is sent

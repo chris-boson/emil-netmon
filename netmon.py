@@ -930,7 +930,7 @@ def hourly_summary(d, hours=48):
                     "s_router": sum(t["router"] is not None and t["router"] > SLOW["router"] for t in ok),
                     "s_net": sum(t["net"] is not None and t["net"] > SLOW["net"] and not (t["router"] or 0) > SLOW["router"] for t in ok),
                     "s_web": sum(t["http"] > SLOW["http"] and not (t["net"] or 0) > SLOW["net"] and not (t["router"] or 0) > SLOW["router"] for t in ok),
-                    "slots": "".join(str(min(9, s)) if s else "." for s in slots),  # "." not "0": Sheets keeps it text
+                    "slots": "".join(str(min(9, s)) if s else "_" for s in slots),  # "_" not "0": never parsed as a number
                     "router_p50": r1(pct([t["router"] for t in g], 50)), "router_p95": r1(pct([t["router"] for t in g], 95)),
                     "router_loss": round(100 * sum(t["router"] is None for t in wr) / len(wr), 1) if wr else None,
                     "hop_p95": r1(pct([t["hop"] for t in g], 95)), "net_p95": r1(pct([t["net"] for t in g], 95)),
@@ -968,7 +968,12 @@ def building_rows(cfg, days):
     if not res.get("ok"):
         raise RuntimeError(res.get("error", "hub error"))
     cols = res.get("cols", [])
-    return [dict(zip(cols, r)) for r in res.get("rows", [])]
+    rows = [dict(zip(cols, r)) for r in res.get("rows", [])]
+    for r in rows:  # Sheets may have stored "504" as the number 504
+        for k in ("device", "label", "gw", "slots"):
+            if r.get(k) is not None:
+                r[k] = str(r[k]).removesuffix(".0") if isinstance(r[k], float) else str(r[k])
+    return rows
 
 
 def building_csv(d, days=30):
@@ -1088,7 +1093,7 @@ def _building_view(d, days):
                     at[int(r["epoch"]) + 300 * i][names[r["device"]]] = int(c)
     # count a moment only if at least a third of the apartments online that hour failed together
     together = [{"epoch": e, "apts": sorted(v.items()), "online": len(online[e - e % 3600])} for e, v in at.items()
-                if len(v) >= max(2, len(online[e - e % 3600]) / 3)]
+                if len(v) >= max(3, len(online[e - e % 3600]) / 3)]
     together.sort(key=lambda x: (-len(x["apts"]), -x["epoch"]))
 
     n = len(devices)
@@ -1104,7 +1109,7 @@ def _building_view(d, days):
         verdict.append(f"{round(100 * inside / tot)}% of failed checks broke inside the building (Wi-Fi, router or building uplink), "
                        f"{round(100 * allf['internet'] / tot)}% at the internet provider, {round(100 * (allf['dns'] + allf['web']) / tot)}% were DNS or web only.")
     if together:
-        verdict.append(f"{len(together)} times, at least a third of the apartments online (and at least two) had failures in the same 5 minutes: a sign of a shared, building-wide problem. The worst moments are listed below.")
+        verdict.append(f"{len(together)} times, at least three apartments (and at least a third of those online) had failures in the same 5 minutes: a sign of a shared, building-wide problem. The worst moments are listed below.")
     lans = [x["lan"] for x in devices if x["lan"]]
     if lans:
         verdict.append(f"Apartments see a median of {pct(lans, 50):.0f} devices on their local network, so everyone is on one shared network.")
@@ -1520,7 +1525,7 @@ a{color:var(--s1)}
 <h3>Problem rate by hour, all apartments</h3><svg id="b_hours"></svg>
 <h3>Problem rate by apartment and hour</h3><div class="scroll"><svg id="b_grid"></svg></div>
 <h3>Apartments</h3><div class="scroll"><table id="b_table"></table></div>
-<div id="b_tog_box" hidden><h3>When several apartments failed at once</h3><p class="sub">5-minute windows in which at least a third of the apartments online had failed checks, most apartments first.</p><div class="scroll"><table id="b_tog"></table></div></div>
+<div id="b_tog_box" hidden><h3>When several apartments failed at once</h3><p class="sub">5-minute windows in which at least three apartments, and at least a third of those online, had failed checks, most apartments first.</p><div class="scroll"><table id="b_tog"></table></div></div>
 <p class="note" style="margin-top:10px"><a href="/api/building.csv">Download the building data (CSV)</a> to attach for building IT: one row per apartment and hour, last 30 days.</p></div>
 <div class="card" id="settings" hidden><h2>Sharing</h2>
 <div id="s_off"><p class="sub">Share stats with your neighbours for the Building view. While you're on EMIL BEWOHNER or EMIL GAST, EMIL NetMon sends once per hour, with your apartment number: how many checks failed or were slow and where they broke (Wi-Fi, router, building uplink, internet, DNS or web), router delay, Wi-Fi signal strength and how crowded your channel is. No websites, names, network names or addresses. Everyone in the building can see these numbers.</p>
