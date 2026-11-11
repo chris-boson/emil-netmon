@@ -38,7 +38,7 @@ function sheet_() {
 
 // keep labels like "504" or "03" and the slots string as text, not numbers
 function text_(sh, row, n) {
-  ['device', 'label', 'gw', 'slots'].forEach(c => sh.getRange(row, C[c] + 1, n, 1).setNumberFormat('@'));
+  ['device', 'label', 'version', 'gw', 'slots'].forEach(c => sh.getRange(row, C[c] + 1, n, 1).setNumberFormat('@'));
 }
 
 function num_(v, lo, hi) {

@@ -43,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.9"
+VERSION = "0.9.1"
 APP_NAME = "EMIL NetMon"
 # The building's hub (hub/Code.gs on a Google Sheet). Everyone who clicks "Share anonymous stats"
 # sends to it; build_app.sh --hub can point a build somewhere else.
@@ -970,7 +970,7 @@ def building_rows(cfg, days):
     cols = res.get("cols", [])
     rows = [dict(zip(cols, r)) for r in res.get("rows", [])]
     for r in rows:  # Sheets may have stored "504" as the number 504
-        for k in ("device", "label", "gw", "slots"):
+        for k in ("device", "label", "gw", "slots", "version"):
             if r.get(k) is not None:
                 r[k] = str(r[k]).removesuffix(".0") if isinstance(r[k], float) else str(r[k])
     return rows
@@ -980,7 +980,7 @@ def building_csv(d, days=30):
     cfg = load_config(d)
     if not hub_of(cfg):
         return ""
-    rows = sorted((r for r in building_rows(cfg, days) if r.get("checks")), key=lambda r: (r.get("epoch") or 0, r.get("label") or "", r.get("device") or ""))
+    rows = sorted((r for r in building_rows(cfg, days) if r.get("checks") and building_era(r)), key=lambda r: (r.get("epoch") or 0, r.get("label") or "", r.get("device") or ""))
     for r in rows:
         r["hour"] = datetime.fromtimestamp(r["epoch"]).astimezone().isoformat() if r.get("epoch") else ""
     cols = ["hour", "local_hour", "label", "device", "gw", "checks", "failed", "slow", "router_p50", "router_p95",
@@ -1007,6 +1007,10 @@ def building_view(d, days=7, max_age=600):
     return view
 
 
+def building_era(r):
+    return vtuple(r.get("version") or "0") >= (0, 8)
+
+
 def _building_view(d, days):
     cfg = load_config(d)
     if not hub_of(cfg):
@@ -1020,8 +1024,12 @@ def _building_view(d, days):
     rows = [r for r in rows if r.get("checks")]  # 0 checks = an hour the app took back
     if not rows:
         return {"configured": True, "devices": [], "by_hour": [], "verdict": ["No apartment has shared data yet."]}
-    gw = Counter(r["gw"] for r in rows).most_common(1)[0][0]
-    rows = [r for r in rows if r["gw"] == gw]
+    # From 0.8 on the app only shares checks made on the EMIL networks. Apartments can sit on different
+    # subnets (different gateway IPs), so keep them all; drop rows from older apps, which shared any network.
+    rows = [r for r in rows if building_era(r)]
+    if not rows:
+        return {"configured": True, "devices": [], "by_hour": [], "verdict": ["No apartment has shared data yet."]}
+    gws = {r["gw"] for r in rows}
     EVE = range(18, 23)
 
     def rate(rs):
@@ -1097,7 +1105,7 @@ def _building_view(d, days):
     together.sort(key=lambda x: (-len(x["apts"]), -x["epoch"]))
 
     n = len(devices)
-    verdict = [f"{n} apartment{'s' if n != 1 else ''} sharing data on network {gw}, last {days} days."]
+    verdict = [f"{n} apartment{'s' if n != 1 else ''} sharing data from the EMIL networks, last {days} days."]
     with_both = sum(1 for x in devices if x["rate_eve"] is not None and x["rate_other"] is not None)
     if with_both:
         verdict.append(f"{peaky} of {with_both} apartments have at least twice as many failed/slow checks in the evening (18–23h) as the rest of the day.")
@@ -1112,8 +1120,9 @@ def _building_view(d, days):
         verdict.append(f"{len(together)} times, at least three apartments (and at least a third of those online) had failures in the same 5 minutes: a sign of a shared, building-wide problem. The worst moments are listed below.")
     lans = [x["lan"] for x in devices if x["lan"]]
     if lans:
-        verdict.append(f"Apartments see a median of {pct(lans, 50):.0f} devices on their local network, so everyone is on one shared network.")
-    return {"configured": True, "gateway": gw, "devices": devices, "by_hour": by_hour, "grid": grid,
+        verdict.append(f"Apartments see a median of {pct(lans, 50):.0f} devices on their local network"
+                       + (", so everyone is on one shared network." if len(gws) == 1 else "."))
+    return {"configured": True, "devices": devices, "by_hour": by_hour, "grid": grid,
             "together": together[:10], "groups": FAIL_GROUPS, "days": days, "verdict": verdict}
 
 
@@ -1682,7 +1691,7 @@ function bdetail(c){const ind=(k,v)=>`<br><span style="padding-left:12px">${esc(
 let B=null;async function loadBuilding(){try{B=await (await fetch("/api/building")).json();renderBuilding()}catch(e){}}
 function renderBuilding(){const box=$("building");if(!B||!B.configured){box.hidden=true;return}box.hidden=false;
  if(B.error){$("b_sub").textContent="Couldn't load the building view: "+B.error;["b_verdict","b_table"].forEach(i=>$(i).innerHTML="");$("b_hours").innerHTML="";$("b_grid").innerHTML="";return}
- $("b_sub").textContent=B.devices.length?`Hourly summaries from ${B.devices.length} apartment(s) on ${B.gateway}. Hover over the charts and table to see what failed. "Problem rate" = share of checks that failed or were slow.`:"";
+ $("b_sub").textContent=B.devices.length?`Hourly summaries from ${B.devices.length} apartment(s). Hover over the charts and table to see what failed. "Problem rate" = share of checks that failed or were slow.`:"";
  $("b_verdict").innerHTML=B.verdict.map(v=>`<li>${esc(v)}</li>`).join("");if(!B.devices.length)return;
  {const svg=$("b_hours");svg.innerHTML="";const W=1000,H=160,L=40,Bt=22,T=10;svg.setAttribute("viewBox",`0 0 ${W} ${H}`);const tk=niceTicks(Math.max(...B.by_hour.map(b=>b.rate),0.5)),top=tk[tk.length-1],bw=(W-L)/24;
   const g=el("g",{class:"grid"},svg),ax=el("g",{class:"axis"},svg);tk.forEach(v=>{const y=T+(H-T-Bt)*(1-v/top);el("line",{x1:L,x2:W,y1:y,y2:y},g);el("text",{x:L-6,y:y+4,"text-anchor":"end"},ax).textContent=v+"%"});
