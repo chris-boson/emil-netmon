@@ -8,7 +8,8 @@ ISP edge → internet → DNS → web) and shows a live dashboard at `http://127
 - **Wi-Fi context:** signal, tx rate, channel, roams, how many nearby networks share your channel,
   and how many devices share your local network.
 - **Security tunnels** (Netskope, Zscaler, …) are detected, so their hiccups aren't blamed on your ISP.
-- **Building view:** anonymous hourly summaries from every apartment that shares, side by side.
+- **Building view:** hourly summaries from every apartment that shares, side by side, with what failed and the moments when many apartments failed at once.
+- **Sleep is not an outage:** with the lid closed, macOS wakes briefly every 15–30 minutes. The check interrupted by sleep and the first 45 s after each wake are ignored.
 
 macOS 12+ only. A single Python file ([`netmon.py`](../netmon.py)) using only the standard library,
 plus a tiny Swift helper for Wi-Fi stats. Data lives in `~/.netmon`; a launchd agent
@@ -24,8 +25,8 @@ python3 netmon.py uninstall    # keeps logs in ~/.netmon
 
 ## Building view
 
-Made for one building (about 100 apartments). Each app that shares sends one anonymous summary
-per hour to the building's hub, and reads every apartment's summaries back for the Building view.
+Made for one building (about 100 apartments). Each app that shares sends one summary
+per hour, with the apartment number, to the building's hub, and reads every apartment's summaries back for the Building view.
 **Download the building data (CSV)** in the Building view gives a file to attach for building IT.
 
 The hub is a Google Sheet with a small Apps Script web app, deployed once by whoever publishes

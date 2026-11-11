@@ -1,6 +1,6 @@
 # EMIL NetMon hub (Google Sheet)
 
-Collects the anonymous hourly summaries from the building's EMIL NetMon apps into one Google
+Collects the hourly summaries from the building's EMIL NetMon apps into one Google
 Sheet and serves them back, so every dashboard can show the **Building view**. Neighbours never
 touch this: it is deployed once by whoever publishes the app, and its URL is `DEFAULT_HUB` in `netmon.py`.
 
@@ -18,8 +18,9 @@ touch this: it is deployed once by whoever publishes the app, and its URL is `DE
 
 Check it works: open `<URL>?action=building` in a browser. You should see `{"ok":true,"cols":[…],"rows":[]}`.
 
-To update the script later: paste the new `Code.gs`, then **Deploy → Manage deployments → Edit →
-Version: New version → Deploy**. The URL stays the same.
+To update the script later: paste the new `Code.gs`, then **Deploy → Manage deployments → Edit (pencil) →
+Version: New version → Deploy**. The URL stays the same. New columns are added to the sheet by
+themselves. Apps keep working with an older script, they just can't show what failed.
 
 ## Permissions and privacy
 
@@ -27,13 +28,16 @@ Version: New version → Deploy**. The URL stays the same.
 |---|---|
 | Hub owner | Sees and edits all rows in the sheet. Can share it read-only with building IT. |
 | Anyone with the app (the URL is in it) | Sends summaries and reads the Building view. |
-| Neighbours | Nothing is sent until they click **Share anonymous stats**; **Stop sharing** stops it. |
+| Neighbours | Nothing is sent until they enter their apartment number and click **Share anonymous stats**; **Stop sharing** stops it. |
 
 Only checks made on the building networks (EMIL BEWOHNER / EMIL GAST, recognised by their DHCP domain
-`emil.local` or the building router) are sent. What is sent, per complete hour: number of checks, failed and slow checks, router / next-hop /
+`emil.local` or the building router) are sent. What is sent, per complete hour: number of checks, failed and slow checks, which rung the failed
+checks broke at (Wi-Fi, router, building uplink, internet, DNS, web) and which the slow ones were slow
+at, failed checks per 5 minutes (column `slots`, `.` = none), router / next-hop /
 internet latency percentiles, router loss, median Wi-Fi signal, number of nearby networks on the
 same channel block, number of devices visible on the LAN, the local gateway IP (e.g. 192.168.1.1),
-a random device id and an optional label the neighbour types (e.g. "3B").
+a random device id and the apartment number the neighbour types (e.g. "3B"). An hour that is sent
+again with 0 checks was withdrawn by the app (e.g. it turned out to be sleep, not an outage).
 
 Never sent: raw checks, websites, Wi-Fi network names, MAC addresses, public IP addresses,
 names or email addresses.

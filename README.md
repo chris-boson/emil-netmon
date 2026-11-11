@@ -19,9 +19,9 @@ Free · macOS 12 or newer · no account needed
    App Store. Click **Done**, then open **System Settings → Privacy & Security**, scroll down and
    click **Open Anyway**.
    If you're asked to install "Command Line Tools", click **Install**, wait until it's done, and open the app again.
-3. Your dashboard opens in the browser. Click **Share anonymous stats**. That's it.
+3. Your dashboard opens in the browser. Type your apartment number and click **Share anonymous stats**. That's it.
 
-![The "Share anonymous stats" button](docs/screenshots/share.png)
+![Apartment number and the "Share anonymous stats" button](docs/screenshots/share.png)
 
 EMIL NetMon keeps running in the background, also after restarts. Open the app again any time to get back to your dashboard.
 
@@ -31,9 +31,11 @@ EMIL NetMon keeps running in the background, also after restarts. Open the app a
 
 ![Problems by day and hour, peaking between 18:00 and 22:00](docs/screenshots/when.png)
 
-**The whole building.** Every apartment that shares appears side by side. If everyone has the
-same problem at the same time, it's the building network, not your laptop. One click downloads
-the data to send to building IT.
+**The whole building.** Every apartment that shares appears side by side. Hover over any hour to
+see what broke: Wi-Fi, the router, the building's line out, the internet provider, DNS or web.
+A list shows the moments when many apartments failed at once. If everyone has the same problem
+at the same time, it's the building network, not your laptop. One click downloads the data to
+send to building IT.
 
 ![Building view: problem rate by hour and by apartment](docs/screenshots/building.png)
 
@@ -42,10 +44,12 @@ the data to send to building IT.
 ## Your privacy
 
 Nothing leaves your Mac until you click **Share anonymous stats**. After that, once per hour,
-and only for time spent on the **EMIL BEWOHNER** or **EMIL GAST** Wi-Fi, it sends only numbers: how many checks failed or were slow, router delay, Wi-Fi signal strength,
-how crowded your Wi-Fi channel is, and an apartment label if you choose to add one.
+and only for time spent on the **EMIL BEWOHNER** or **EMIL GAST** Wi-Fi, it sends your apartment
+number and numbers only: how many checks failed or were slow and where they broke, router delay,
+Wi-Fi signal strength and how crowded your Wi-Fi channel is.
 
-It never sends websites you visit, network names, addresses, names or email addresses.
+It never sends websites you visit, network names, addresses, names or email addresses. Time when
+your Mac is asleep (lid closed) isn't counted.
 Everyone in the building can see the shared numbers. Click **Stop sharing** at any time.
 
 ## Stop or uninstall

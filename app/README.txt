@@ -5,8 +5,8 @@ EMIL NetMon checks your connection every 10 seconds (Wi-Fi signal, your router, 
 building's line out, the internet, DNS, web) and shows a live dashboard in your
 browser: when problems happen and which step of the chain fails.
 
-Everything stays on your Mac unless you choose to share anonymous hourly
-summaries with the building view.
+Everything stays on your Mac unless you choose to share hourly summaries
+with the building view.
 
 INSTALL (Mac only, macOS 12 or newer)
 1. Unzip, then move EMIL NetMon.app to your Applications folder.
@@ -21,11 +21,13 @@ INSTALL (Mac only, macOS 12 or newer)
    ("python3") was added. That's EMIL NetMon, so leave it switched on.
 
 SHARING WITH THE BUILDING (optional)
-Click "Share anonymous stats" in the dashboard. That's all. Your dashboard then
-also shows the Building view: every sharing apartment side by side.
-Only per-hour counts and timings are shared: failed/slow checks, router delay,
-Wi-Fi signal strength, how crowded your channel is. No websites, network
-names, addresses or personal data. Click "Stop sharing" any time.
+Type your apartment number and click "Share anonymous stats" in the dashboard.
+That's all. Your dashboard then also shows the Building view: every sharing
+apartment side by side. Only per-hour counts and timings are shared, with your
+apartment number: failed/slow checks and where they broke, router delay, Wi-Fi
+signal strength, how crowded your channel is. Only time on EMIL BEWOHNER or
+EMIL GAST counts. No websites, names, network names or addresses.
+Click "Stop sharing" any time.
 
 STOP / UNINSTALL
 Click "Stop monitoring and uninstall" at the bottom of the dashboard.

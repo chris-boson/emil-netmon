@@ -43,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.8"
+VERSION = "0.9"
 APP_NAME = "EMIL NetMon"
 # The building's hub (hub/Code.gs on a Google Sheet). Everyone who clicks "Share anonymous stats"
 # sends to it; build_app.sh --hub can point a build somewhere else.
@@ -410,6 +410,8 @@ def run(args):
                    "tx_rate": wi.get("tx_rate", "") if wi.get("up") else "",
                    "channel": wi.get("channel", "") if wi.get("up") else "",
                    "note": "" if gw else "no_route"}
+            if time.time() - wall > max(3 * args.interval, 45):
+                continue  # the Mac slept during this check; the next round logs the sleep gap
             w.writerow(row)
             f.flush()
             if args.verbose:
@@ -478,7 +480,30 @@ def load_ticks(d):
                 t["net"] = min([x for x in (t["cf"], t["goog"]) if x is not None], default=None)
                 ticks.append(t)
     ticks.sort(key=lambda t: t["ts"])
-    return ticks
+    return drop_sleep_artifacts(ticks)
+
+
+WAKE_SETTLE = 45  # seconds after a wake while Wi-Fi, DNS and tunnels reconnect
+
+
+def drop_sleep_artifacts(ticks):
+    """With the lid closed, macOS wakes briefly every 15-30 min (Power Nap / dark wake). The check
+    that was running when the Mac fell asleep finishes after the wake, and the first checks after a
+    wake fail while Wi-Fi reconnects. Neither says anything about the network, so both are dropped."""
+    out, wake = [], None
+    for i, t in enumerate(ticks):
+        if t["gap"]:
+            wake = t["ts"]
+            out.append(t)
+            continue
+        if i + 1 < len(ticks) and ticks[i + 1]["gap"]:
+            continue  # started before sleep, finished after the wake
+        if wake and (t["ts"] - wake).total_seconds() < WAKE_SETTLE:
+            continue
+        if any((t[k] or 0) > 60000 for k in ("router", "hop", "cf", "goog", "dns", "http")):
+            continue  # a probe "took" minutes: the Mac slept during it
+        out.append(t)
+    return out
 
 
 LAYERS = {
@@ -492,6 +517,11 @@ LAYERS = {
     "http_tunnel": ("Web via security tunnel", "Everything else fine; HTTPS through the security tunnel (e.g. Netskope) failed"),
     "http": ("Web (HTTPS) only", "Pings and DNS fine, HTTPS fetch failed"),
 }
+# what the building hub gets: which rung broke, in six plain groups
+FAIL_GROUPS = {"wifi": "Wi-Fi", "router": "Router / building Wi-Fi", "uplink": "Building uplink",
+               "internet": "Internet", "dns": "DNS", "web": "Web only"}
+FAIL_GROUP = {"wifi_link": "wifi", "wifi_weak": "wifi", "local": "router", "local_or_isp": "router",
+              "next_hop": "uplink", "upstream": "internet", "dns": "dns", "http": "web", "http_tunnel": "web"}
 LOCAL_LAYERS = {"wifi_link", "wifi_weak", "local"}
 ISP_LAYERS = {"next_hop", "upstream"}
 
@@ -888,8 +918,19 @@ def hourly_summary(d, hours=48):
             continue
         en = env.get((h, gw), [])
         wr = [t for t in g if t["v2"]]
+        fails = Counter(FAIL_GROUP[t["state"]] for t in g if t["state"] != "ok")
+        slots = [0] * 12  # failed checks per 5 minutes, to spot apartments failing at the same moment
+        for t in g:
+            if t["state"] != "ok":
+                slots[t["ts"].minute // 5] += 1
+        ok = [t for t in g if t["state"] == "ok"]
         out.append({"hour": h.isoformat(), "epoch": int(h.timestamp()), "local_hour": h.hour, "gw": gw, "checks": len(g),
                     "failed": sum(t["state"] != "ok" for t in g), "slow": sum(t["state"] == "ok" and is_slow(t) for t in g),
+                    **{"f_" + k: fails[k] for k in FAIL_GROUPS},
+                    "s_router": sum(t["router"] is not None and t["router"] > SLOW["router"] for t in ok),
+                    "s_net": sum(t["net"] is not None and t["net"] > SLOW["net"] and not (t["router"] or 0) > SLOW["router"] for t in ok),
+                    "s_web": sum(t["http"] > SLOW["http"] and not (t["net"] or 0) > SLOW["net"] and not (t["router"] or 0) > SLOW["router"] for t in ok),
+                    "slots": "".join(str(min(9, s)) if s else "." for s in slots),  # "." not "0": Sheets keeps it text
                     "router_p50": r1(pct([t["router"] for t in g], 50)), "router_p95": r1(pct([t["router"] for t in g], 95)),
                     "router_loss": round(100 * sum(t["router"] is None for t in wr) / len(wr), 1) if wr else None,
                     "hop_p95": r1(pct([t["hop"] for t in g], 95)), "net_p95": r1(pct([t["net"] for t in g], 95)),
@@ -934,11 +975,12 @@ def building_csv(d, days=30):
     cfg = load_config(d)
     if not hub_of(cfg):
         return ""
-    rows = sorted(building_rows(cfg, days), key=lambda r: (r.get("epoch") or 0, r.get("label") or "", r.get("device") or ""))
+    rows = sorted((r for r in building_rows(cfg, days) if r.get("checks")), key=lambda r: (r.get("epoch") or 0, r.get("label") or "", r.get("device") or ""))
     for r in rows:
         r["hour"] = datetime.fromtimestamp(r["epoch"]).astimezone().isoformat() if r.get("epoch") else ""
     cols = ["hour", "local_hour", "label", "device", "gw", "checks", "failed", "slow", "router_p50", "router_p95",
-            "router_loss", "hop_p95", "net_p95", "rssi", "same_block", "lan", "version"]
+            "router_loss", "hop_p95", "net_p95", "rssi", "same_block", "lan",
+            "f_wifi", "f_router", "f_uplink", "f_internet", "f_dns", "f_web", "s_router", "s_net", "s_web", "slots", "version"]
     import io
     buf = io.StringIO()
     w = csv.DictWriter(buf, cols, extrasaction="ignore")
@@ -970,6 +1012,9 @@ def _building_view(d, days):
         return {"configured": True, "error": str(e)}
     if not rows:
         return {"configured": True, "devices": [], "by_hour": [], "verdict": ["No apartment has shared data yet."]}
+    rows = [r for r in rows if r.get("checks")]  # 0 checks = an hour the app took back
+    if not rows:
+        return {"configured": True, "devices": [], "by_hour": [], "verdict": ["No apartment has shared data yet."]}
     gw = Counter(r["gw"] for r in rows).most_common(1)[0][0]
     rows = [r for r in rows if r["gw"] == gw]
     EVE = range(18, 23)
@@ -978,62 +1023,130 @@ def _building_view(d, days):
         n = sum(r["checks"] for r in rs)
         return round(100 * sum(r["failed"] + r["slow"] for r in rs) / n, 2) if n else None
 
+    def med(rs, k):
+        return pct([r[k] for r in rs if r.get(k) not in ("", None)], 50)
+
+    def detail(rs):
+        """Totals for hover text: what failed and what was slow."""
+        out = {"checks": sum(r["checks"] for r in rs), "failed": sum(r["failed"] for r in rs),
+               "slow": sum(r["slow"] for r in rs), "router_p95": med(rs, "router_p95"), "rssi": med(rs, "rssi")}
+        if any(r.get("f_wifi") not in ("", None) for r in rs):  # apps from 0.9 on send the breakdown
+            out["fail"] = {k: sum(int(r.get("f_" + k) or 0) for r in rs) for k in FAIL_GROUPS}
+            out["slow_at"] = {k: sum(int(r.get("s_" + k) or 0) for r in rs) for k in ("router", "net", "web")}
+        return out
+
     devs = defaultdict(list)
     for r in rows:
         devs[r["device"]].append(r)
+    names = {dev: next((r["label"] for r in sorted(rs, key=lambda r: -int(r["epoch"])) if r.get("label")), "") or f"#{dev[:4]}"
+             for dev, rs in devs.items()}
+    dup = Counter(names.values())
+    seen = Counter()
+    for dev in sorted(devs, key=lambda x: min(int(r["epoch"]) for r in devs[x])):
+        if dup[names[dev]] > 1:  # two Macs in the same apartment
+            seen[names[dev]] += 1
+            names[dev] = f"{names[dev]} ({seen[names[dev]]})"
     devices, peaky, router_peaky = [], 0, 0
     for dev, rs in devs.items():
         ev = [r for r in rs if int(r["local_hour"]) in EVE]
         ot = [r for r in rs if int(r["local_hour"]) not in EVE]
         rev, rot = rate(ev), rate(ot)
-        pev = pct([r["router_p95"] for r in ev if r["router_p95"] not in ("", None)], 50)
-        pot = pct([r["router_p95"] for r in ot if r["router_p95"] not in ("", None)], 50)
+        pev, pot = med(ev, "router_p95"), med(ot, "router_p95")
         if rev is not None and rot is not None and rev >= max(1, 2 * rot):
             peaky += 1
         if pev and pot and pev >= 2 * pot:
             router_peaky += 1
-        label = next((r["label"] for r in reversed(rs) if r.get("label")), "") or f"#{dev[:4]}"
-        devices.append({"device": dev, "label": label, "hours": len(rs),
+        det = detail(rs)
+        top = max(det.get("fail", {}).items(), key=lambda kv: kv[1], default=(None, 0))
+        devices.append({"device": dev, "label": names[dev], "hours": len(rs),
                         "last": max(int(r["epoch"]) for r in rs), "rate_eve": rev, "rate_other": rot,
-                        "router_eve": pev, "router_other": pot,
-                        "rssi": pct([r["rssi"] for r in rs if r["rssi"] not in ("", None)], 50),
-                        "same_block": pct([r["same_block"] for r in rs if r["same_block"] not in ("", None)], 50),
-                        "lan": pct([r["lan"] for r in rs if r["lan"] not in ("", None)], 50)})
+                        "router_eve": pev, "router_other": pot, "rssi": med(rs, "rssi"),
+                        "same_block": med(rs, "same_block"), "lan": med(rs, "lan"), "detail": det,
+                        "breaks_at": FAIL_GROUPS[top[0]] if top[1] else ""})
     devices.sort(key=lambda x: -(x["rate_eve"] or 0))
     by_hour = []
     for h in range(24):
         rs = [r for r in rows if int(r["local_hour"]) == h]
         by_hour.append({"hour": h, "rate": rate(rs) or 0, "apts": len({r["device"] for r in rs}),
-                        "router_p95": pct([r["router_p95"] for r in rs if r["router_p95"] not in ("", None)], 50)})
+                        "apts_failed": len({r["device"] for r in rs if r["failed"]}), **detail(rs)})
     grid = []
     for dv in devices:
         for h in range(24):
             rs = [r for r in devs[dv["device"]] if int(r["local_hour"]) == h]
             if rs:
-                grid.append({"label": dv["label"], "hour": h, "rate": rate(rs), "hours": len(rs)})
+                grid.append({"device": dv["device"], "label": dv["label"], "hour": h, "rate": rate(rs), "hours": len(rs), **detail(rs)})
+
+    # moments when several apartments had failed checks in the same 5 minutes
+    at, online = defaultdict(dict), defaultdict(set)
+    for r in rows:
+        online[int(r["epoch"])].add(r["device"])
+    for r in rows:
+        sl = str(r.get("slots") or "")
+        if len(sl) == 12:
+            for i, c in enumerate(sl):
+                if c.isdigit() and c != "0":
+                    at[int(r["epoch"]) + 300 * i][names[r["device"]]] = int(c)
+    # count a moment only if at least a third of the apartments online that hour failed together
+    together = [{"epoch": e, "apts": sorted(v.items()), "online": len(online[e - e % 3600])} for e, v in at.items()
+                if len(v) >= max(2, len(online[e - e % 3600]) / 3)]
+    together.sort(key=lambda x: (-len(x["apts"]), -x["epoch"]))
+
     n = len(devices)
     verdict = [f"{n} apartment{'s' if n != 1 else ''} sharing data on network {gw}, last {days} days."]
     with_both = sum(1 for x in devices if x["rate_eve"] is not None and x["rate_other"] is not None)
     if with_both:
         verdict.append(f"{peaky} of {with_both} apartments have at least twice as many failed/slow checks in the evening (18–23h) as the rest of the day.")
         verdict.append(f"In {router_peaky} of {with_both} apartments the router itself answers at least twice as slowly in the evening, so the slowdown is inside the building network, before the internet.")
+    allf = detail(rows).get("fail")
+    if allf and sum(allf.values()):
+        tot = sum(allf.values())
+        inside = allf["wifi"] + allf["router"] + allf["uplink"]
+        verdict.append(f"{round(100 * inside / tot)}% of failed checks broke inside the building (Wi-Fi, router or building uplink), "
+                       f"{round(100 * allf['internet'] / tot)}% at the internet provider, {round(100 * (allf['dns'] + allf['web']) / tot)}% were DNS or web only.")
+    if together:
+        verdict.append(f"{len(together)} times, at least a third of the apartments online (and at least two) had failures in the same 5 minutes: a sign of a shared, building-wide problem. The worst moments are listed below.")
     lans = [x["lan"] for x in devices if x["lan"]]
     if lans:
         verdict.append(f"Apartments see a median of {pct(lans, 50):.0f} devices on their local network, so everyone is on one shared network.")
-    return {"configured": True, "gateway": gw, "devices": devices, "by_hour": by_hour, "grid": grid, "verdict": verdict}
+    return {"configured": True, "gateway": gw, "devices": devices, "by_hour": by_hour, "grid": grid,
+            "together": together[:10], "groups": FAIL_GROUPS, "days": days, "verdict": verdict}
 
 
 def share_once(d):
     cfg = load_config(d)
     if not (cfg["share"] and hub_of(cfg)):
         return
+    if not cfg["label"]:
+        SHARE_STATUS["ok"], SHARE_STATUS["msg"] = False, "paused until you enter your apartment number"
+        return
+    hours = hourly_summary(d)
+    # Hours sent earlier that no longer qualify (e.g. sleep artefacts now filtered out) are sent
+    # again with 0 checks, so the building view stops counting them.
+    sent_path = d / "shared.json"
+    try:
+        sent = json.loads(sent_path.read_text())
+    except (OSError, ValueError):  # first run after updating from 0.8: any recent hour may have been sent
+        top = int(datetime.now().astimezone().replace(minute=0, second=0, microsecond=0).timestamp())
+        sent = {f"{top - 3600 * i}|{gw}": top - 3600 * i for i in range(1, 49) for gw in {h["gw"] for h in hours}}
+    keep_after = time.time() - 49 * 3600  # hourly_summary covers the last 48 hours
+    sent = {k: e for k, e in sent.items() if e >= keep_after}
+    have = {f"{h['epoch']}|{h['gw']}" for h in hours}
+    for k, e in sent.items():
+        if k not in have:
+            gw = k.split("|", 1)[1]
+            hours.append({"epoch": e, "hour": datetime.fromtimestamp(e).astimezone().isoformat(),
+                          "local_hour": datetime.fromtimestamp(e).hour, "gw": gw, "checks": 0, "failed": 0, "slow": 0})
     payload = {"action": "ingest", "device": cfg["device_id"],
-               "label": cfg["label"][:20], "version": VERSION, "hours": hourly_summary(d)}
+               "label": cfg["label"][:20], "version": VERSION, "hours": hours}
     SHARE_STATUS["last"] = now_iso()
     try:
         res = curl_json(hub_of(cfg), payload)
         SHARE_STATUS["ok"] = bool(res.get("ok"))
-        SHARE_STATUS["msg"] = f"sent {len(payload['hours'])} hourly summaries" if res.get("ok") else res.get("error", "rejected")
+        if res.get("ok"):
+            sent.update({f"{h['epoch']}|{h['gw']}": h["epoch"] for h in hours if h["checks"]})
+            sent = {k: e for k, e in sent.items() if k in have}
+            sent_path.write_text(json.dumps(sent))
+        SHARE_STATUS["msg"] = f"sent {len(have)} hourly summaries" if res.get("ok") else res.get("error", "rejected")
         if "too frequent" in SHARE_STATUS["msg"]:  # hub's per-device limit; the next round retries anyway
             SHARE_STATUS["ok"], SHARE_STATUS["msg"] = None, "sent recently, next update within 30 minutes"
     except RuntimeError as e:
@@ -1218,11 +1331,15 @@ def start_server(d, port):
             out = {"ok": True}
             if u == "/api/config":
                 cfg = load_config(d)
-                was = cfg["share"]
+                was = cfg["share"] and bool(cfg["label"])  # sharing without a label is paused
                 if "share" in data:
                     cfg["share"] = bool(data["share"])
                 if "label" in data:
-                    cfg["label"] = str(data["label"]).strip()[:20]
+                    cfg["label"] = " ".join(str(data["label"]).split())[:20]
+                if cfg["share"] and not cfg["label"]:
+                    self.send_response(400); self.send_header("Content-Type", "application/json"); self.end_headers()
+                    self.wfile.write(json.dumps({"ok": False, "error": "Enter your apartment number first."}).encode())
+                    return
                 cfg["asked"] = True
                 save_config(d, cfg)
                 if cfg["share"] and not was:
@@ -1380,6 +1497,7 @@ th{color:var(--text2);font-weight:500}td.num{font-variant-numeric:tabular-nums;w
 h3{font-size:13px;color:var(--text2);font-weight:500;margin:16px 0 6px}
 button{font:inherit;padding:6px 12px;border-radius:6px;border:1px solid var(--s1);background:var(--s1);color:#fff;cursor:pointer}
 button.ghost{background:transparent;color:var(--text);border-color:var(--line)}
+.sharerow{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.lblin{font:inherit;padding:6px 8px;border-radius:6px;border:1px solid var(--line);background:var(--surface);color:var(--text);width:180px}
 .form{display:grid;gap:10px;max-width:560px}.form label{display:grid;gap:4px;font-size:13px;color:var(--text2)}
 .form label:first-child{display:flex;gap:8px;align-items:center;color:var(--text)}
 .form input:not([type]){font:inherit;padding:6px 8px;border-radius:6px;border:1px solid var(--line);background:var(--surface);color:var(--text);width:100%}
@@ -1394,22 +1512,23 @@ a{color:var(--s1)}
 </div>
 <div class="card" id="upd" hidden style="border-color:var(--s1)"><h2 id="upd_title"></h2><p class="sub" id="upd_notes"></p>
 <button id="upd_go">Update now</button> <span class="note" id="upd_msg"></span></div>
-<div class="card" id="invite" hidden style="border-color:var(--s1)"><h2>Help get the building's internet fixed</h2>
-<p class="sub">Share anonymous stats with your neighbours, so the Building view can show whether everyone has the same problem at the same times. While you're on EMIL BEWOHNER or EMIL GAST, EMIL NetMon sends once per hour how many checks failed or were slow, router delay, Wi-Fi signal strength and how crowded your channel is. No websites, network names or addresses. Everyone in the building can see these numbers.</p>
-<button class="sharebtn">Share anonymous stats</button> <button id="inv_no" class="ghost">Not now</button></div>
+<div class="card" id="invite" hidden style="border-color:var(--s1)"><h2 id="inv_title">Help get the building's internet fixed</h2>
+<p class="sub" id="inv_sub">Share stats with your neighbours, so the Building view can show whether everyone has the same problem at the same times. While you're on EMIL BEWOHNER or EMIL GAST, EMIL NetMon sends once per hour, with your apartment number: how many checks failed or were slow and where they broke (Wi-Fi, router, building uplink, internet, DNS or web), router delay, Wi-Fi signal strength and how crowded your channel is. No websites, names, network names or addresses. Everyone in the building can see these numbers.</p>
+<div class="sharerow"><input class="lblin" maxlength="20" placeholder="Apartment, e.g. 3B" aria-label="Apartment number"> <button class="sharebtn">Share anonymous stats</button> <button id="inv_no" class="ghost">Not now</button></div><p class="note shareerr" hidden></p></div>
 <div id="body"></div>
 <div class="card" id="building" hidden><h2>Building view</h2><p class="sub" id="b_sub"></p><ul class="verdict" id="b_verdict"></ul>
 <h3>Problem rate by hour, all apartments</h3><svg id="b_hours"></svg>
 <h3>Problem rate by apartment and hour</h3><div class="scroll"><svg id="b_grid"></svg></div>
 <h3>Apartments</h3><div class="scroll"><table id="b_table"></table></div>
+<div id="b_tog_box" hidden><h3>When several apartments failed at once</h3><p class="sub">5-minute windows in which at least a third of the apartments online had failed checks, most apartments first.</p><div class="scroll"><table id="b_tog"></table></div></div>
 <p class="note" style="margin-top:10px"><a href="/api/building.csv">Download the building data (CSV)</a> to attach for building IT: one row per apartment and hour, last 30 days.</p></div>
 <div class="card" id="settings" hidden><h2>Sharing</h2>
-<div id="s_off"><p class="sub">Share anonymous stats with your neighbours for the Building view. While you're on EMIL BEWOHNER or EMIL GAST, EMIL NetMon sends once per hour how many checks failed or were slow, router delay, Wi-Fi signal strength and how crowded your channel is. No websites, network names or addresses. Everyone in the building can see these numbers.</p>
-<button class="sharebtn">Share anonymous stats</button></div>
-<div id="s_on" hidden><p class="sub">You're sharing anonymous stats with the building. <span id="c_status"></span></p>
-<p class="note" id="s_net"></p>
-<div class="form"><label>Apartment label (optional, shown to neighbours) <input id="c_label" maxlength="20" placeholder="e.g. 3B"></label>
-<div><button id="c_save" class="ghost">Save label</button> <button id="s_stop" class="ghost">Stop sharing</button></div></div></div>
+<div id="s_off"><p class="sub">Share stats with your neighbours for the Building view. While you're on EMIL BEWOHNER or EMIL GAST, EMIL NetMon sends once per hour, with your apartment number: how many checks failed or were slow and where they broke (Wi-Fi, router, building uplink, internet, DNS or web), router delay, Wi-Fi signal strength and how crowded your channel is. No websites, names, network names or addresses. Everyone in the building can see these numbers.</p>
+<div class="sharerow"><input class="lblin" maxlength="20" placeholder="Apartment, e.g. 3B" aria-label="Apartment number"> <button class="sharebtn">Share anonymous stats</button></div><p class="note shareerr" hidden></p></div>
+<div id="s_on" hidden><p class="sub" id="s_onmsg"><span id="s_lead">You're sharing stats with the building.</span> <span id="c_status"></span></p>
+<p class="note" id="s_net"></p><p class="note" id="s_need" hidden style="color:var(--crit)">Sharing is paused: enter your apartment number and click Save.</p>
+<div class="form"><label>Apartment number (shown to neighbours) <input id="c_label" maxlength="20" placeholder="e.g. 3B"></label>
+<div><button id="c_save" class="ghost">Save</button> <button id="s_stop" class="ghost">Stop sharing</button></div></div></div>
 <p class="note" id="s_nohub" hidden>Sharing isn't set up in this copy of EMIL NetMon.</p>
 <div id="s_tell"><h3 style="margin-top:16px">Tell your neighbours</h3><p class="sub">The more apartments share, the stronger the evidence. Paste this into your building chat:</p>
 <textarea id="c_msg" readonly rows="6" style="font:inherit;font-size:13px;width:100%;max-width:640px;padding:8px;border-radius:6px;border:1px solid var(--line);background:var(--surface);color:var(--text)"></textarea>
@@ -1529,36 +1648,50 @@ async function loadConfig(){try{const c=C=await (await fetch("/api/config")).jso
  if(updating&&c.version!==updating){location.reload();return}
  const u=c.update||{};$("upd").hidden=!(u.latest||updating);if(u.latest){$("upd_title").textContent=`Update available: EMIL NetMon ${u.latest}`;$("upd_notes").textContent=(u.notes?u.notes+" ":"")+`You have ${c.version}. Your data and settings are kept.`}
  if(u.state==="error"){updating=null;$("upd_go").disabled=false;$("upd_msg").textContent=u.msg}else if(updating)$("upd_msg").textContent=u.msg||"Updating…";
- $("invite").hidden=!(c.hub&&!c.share&&!c.asked&&!notNow);$("s_off").hidden=!c.hub||c.share;$("s_on").hidden=!c.share;$("s_nohub").hidden=c.hub;$("s_tell").hidden=!c.hub;
- if(document.activeElement.tagName!=="INPUT")$("c_label").value=c.label||"";
+ const paused=c.share&&!c.label;$("invite").hidden=!(c.hub&&((!c.share&&!c.asked&&!notNow)||paused));$("s_need").hidden=!paused;
+ $("inv_title").textContent=paused?"Add your apartment number":"Help get the building's internet fixed";$("inv_no").hidden=paused;
+ document.querySelectorAll(".sharebtn").forEach(b=>b.textContent=paused?"Resume sharing":"Share anonymous stats");$("s_off").hidden=!c.hub||c.share;$("s_on").hidden=!c.share;$("s_nohub").hidden=c.hub;$("s_tell").hidden=!c.hub;
+ if(document.activeElement.tagName!=="INPUT"){$("c_label").value=c.label||"";document.querySelectorAll(".lblin").forEach(i=>i.value=c.label||"")}
  const st=c.status;$("s_net").textContent=c.on_building_net===false?"You're not on an EMIL network right now, so nothing from this network is shared. Only checks made on EMIL BEWOHNER or EMIL GAST count.":c.on_building_net?"You're on an EMIL network: these checks count for the building.":"";
- $("c_status").textContent=st.last?`Last sent ${new Date(st.last).toLocaleTimeString()}: ${st.msg}.`:"The first summary goes out within a minute.";
- $("c_msg").value=`Is the internet in our building dropping out for you too, especially in the evenings? I'm collecting evidence for building IT with EMIL NetMon, a free Mac app (macOS 12+) that measures where the connection breaks: Wi-Fi, router, building network or internet provider.\n\nDownload, unzip and open it, then click "Share anonymous stats": ${c.download_url}\n\nOnly anonymous hourly numbers are shared (failed checks, delays, Wi-Fi signal). No websites, network names or addresses.`;
+ $("s_lead").textContent=paused?"Sharing is paused.":"You're sharing stats with the building.";$("c_status").hidden=paused;$("c_status").textContent=st.last?`Last sent ${new Date(st.last).toLocaleTimeString()}: ${st.msg}.`:"The first summary goes out within a minute.";
+ $("c_msg").value=`Is the internet in our building dropping out for you too, especially in the evenings? I'm collecting evidence for building IT with EMIL NetMon, a free Mac app (macOS 12+) that measures where the connection breaks: Wi-Fi, router, building network or internet provider.\n\nDownload, unzip and open it, then type your apartment number and click "Share anonymous stats": ${c.download_url}\n\nOnly hourly numbers are shared, with your apartment number (failed checks, delays, Wi-Fi signal). No websites, names or addresses.`;
  if(c.hub)loadBuilding();else $("building").hidden=true}catch(e){}}
 async function saveConfig(b){await post("/api/config",b);await loadConfig();setTimeout(loadConfig,5000)}
-document.querySelectorAll(".sharebtn").forEach(x=>x.onclick=()=>saveConfig({share:true}));
+document.querySelectorAll(".sharebtn").forEach(x=>x.onclick=async()=>{const box=x.closest(".card"),inp=box.querySelector(".lblin"),err=box.querySelector(".shareerr"),label=inp.value.trim();
+ if(!label){err.textContent="Enter your apartment number first, so neighbours can tell the apartments apart.";err.hidden=false;inp.focus();return}
+ err.hidden=true;const r=await post("/api/config",{share:true,label});if(!r.ok){err.textContent=r.error||"Couldn't start sharing.";err.hidden=false;return}await loadConfig();setTimeout(loadConfig,5000)});
 $("inv_no").onclick=()=>{notNow=true;$("invite").hidden=true;post("/api/config",{})};
 $("s_stop").onclick=()=>{if(confirm("Stop sharing? Summaries already sent stay in the Building view for up to 60 days."))saveConfig({share:false})};
-$("c_save").onclick=()=>saveConfig({label:$("c_label").value});
+$("c_save").onclick=async()=>{if(!$("c_label").value.trim()){$("s_need").hidden=false;$("c_label").focus();return}await saveConfig({label:$("c_label").value})};
 $("upd_go").onclick=async()=>{updating=C.version;$("upd_go").disabled=true;$("upd_msg").textContent="Updating…";await post("/api/update");
  const t=setInterval(async()=>{if(!updating){clearInterval(t);return}await loadConfig()},2000);setTimeout(()=>{if(updating){clearInterval(t);$("upd_msg").textContent="This is taking long. Open EMIL NetMon again from Applications."}},120000)};
 $("c_copy").onclick=()=>{$("c_msg").select();try{navigator.clipboard.writeText($("c_msg").value)}catch(e){document.execCommand("copy")}$("c_copy").textContent="Copied"};
 $("c_uninstall").onclick=async e=>{e.preventDefault();if(!confirm("Stop netmon and remove it from login items? Your logs in ~/.netmon are kept."))return;await post("/api/uninstall");document.body.innerHTML='<main><h1>Monitoring stopped</h1><p class="sub">It no longer runs at login. Your logs are still in ~/.netmon. To start again, open the EMIL NetMon app.</p></main>'};
+const RUNGS=["wifi","router","uplink","internet","dns","web"];
+function bdetail(c){const ind=(k,v)=>`<br><span style="padding-left:12px">${esc(k)}: ${v}</span>`;
+ let s=`${c.checks} checks · <b>${c.failed} failed</b> · <b>${c.slow} slow</b>`;
+ if(c.fail){const f=RUNGS.filter(k=>c.fail[k]).sort((a,b)=>c.fail[b]-c.fail[a]);if(f.length)s+="<br>Failed at:"+f.map(k=>ind(B.groups[k],c.fail[k])).join("");
+  const sl=[["router","Router"],["net","Internet"],["web","Web"]].filter(([k])=>c.slow_at[k]).sort((a,b)=>c.slow_at[b[0]]-c.slow_at[a[0]]);if(sl.length)s+="<br>Slow at:"+sl.map(([k,n])=>ind(n,c.slow_at[k])).join("")}
+ else if(c.failed)s+=`<br><span style="color:var(--muted)">No breakdown (app older than 0.9 or hub not updated)</span>`;
+ return s+`<br>Router p95 (median): ${ms(c.router_p95)}`+(c.rssi!=null?` · Wi-Fi ${Math.round(c.rssi)} dBm`:"")}
 let B=null;async function loadBuilding(){try{B=await (await fetch("/api/building")).json();renderBuilding()}catch(e){}}
 function renderBuilding(){const box=$("building");if(!B||!B.configured){box.hidden=true;return}box.hidden=false;
  if(B.error){$("b_sub").textContent="Couldn't load the building view: "+B.error;["b_verdict","b_table"].forEach(i=>$(i).innerHTML="");$("b_hours").innerHTML="";$("b_grid").innerHTML="";return}
- $("b_sub").textContent=B.devices.length?`Anonymous hourly summaries from ${B.devices.length} apartment(s) on ${B.gateway}. "Problem rate" = share of checks that failed or were slow.`:"";
+ $("b_sub").textContent=B.devices.length?`Hourly summaries from ${B.devices.length} apartment(s) on ${B.gateway}. Hover over the charts and table to see what failed. "Problem rate" = share of checks that failed or were slow.`:"";
  $("b_verdict").innerHTML=B.verdict.map(v=>`<li>${esc(v)}</li>`).join("");if(!B.devices.length)return;
  {const svg=$("b_hours");svg.innerHTML="";const W=1000,H=160,L=40,Bt=22,T=10;svg.setAttribute("viewBox",`0 0 ${W} ${H}`);const tk=niceTicks(Math.max(...B.by_hour.map(b=>b.rate),0.5)),top=tk[tk.length-1],bw=(W-L)/24;
   const g=el("g",{class:"grid"},svg),ax=el("g",{class:"axis"},svg);tk.forEach(v=>{const y=T+(H-T-Bt)*(1-v/top);el("line",{x1:L,x2:W,y1:y,y2:y},g);el("text",{x:L-6,y:y+4,"text-anchor":"end"},ax).textContent=v+"%"});
   B.by_hour.forEach(b=>{const hg=(H-T-Bt)*b.rate/top,x=L+b.hour*bw+2,w=bw-4;if(b.rate>0)el("path",{d:roundTop(x,H-Bt-hg,w,hg,4),fill:"var(--s1)"},svg);el("text",{x:x+w/2,y:H-6,"text-anchor":"middle"},ax).textContent=pad(b.hour);
-   hover(el("rect",{x:L+b.hour*bw,y:T,width:bw,height:H-T-Bt,fill:"transparent"},svg),`<b>${pad(b.hour)}:00</b><br>${b.rate}% problem rate<br>${b.apts} apartment(s) reporting<br>Router p95 (median): ${ms(b.router_p95)}`)})}
- {const svg=$("b_grid");svg.innerHTML="";const labels=B.devices.map(d=>d.label),cw=30,ch=20,L=90,T=18,W=L+24*cw,H=T+labels.length*ch+4;svg.setAttribute("viewBox",`0 0 ${W} ${H}`);svg.style.minWidth=W+"px";
+   hover(el("rect",{x:L+b.hour*bw,y:T,width:bw,height:H-T-Bt,fill:"transparent"},svg),`<b>${pad(b.hour)}:00–${pad(b.hour)}:59, all days</b><br>${b.rate}% problem rate · ${b.apts_failed} of ${b.apts} apartment(s) had failures<br>${bdetail(b)}`)})}
+ {const svg=$("b_grid");svg.innerHTML="";const labels=B.devices.map(d=>d.label),ids=B.devices.map(d=>d.device),cw=30,ch=20,L=90,T=18,W=L+24*cw,H=T+labels.length*ch+4;svg.setAttribute("viewBox",`0 0 ${W} ${H}`);svg.style.minWidth=W+"px";
   const mx=Math.max(1,...B.grid.map(c=>c.rate||0)),g=el("g",{class:"axis"},svg);for(let h=0;h<24;h+=2)el("text",{x:L+h*cw+cw/2,y:12,"text-anchor":"middle"},g).textContent=pad(h);
   labels.forEach((l,i)=>el("text",{x:L-8,y:T+i*ch+ch/2+4,"text-anchor":"end"},g).textContent=l);
-  B.grid.forEach(c=>{const i=labels.indexOf(c.label),q=!c.rate?0:Math.min(5,1+Math.floor(4*c.rate/mx));hover(el("rect",{x:L+c.hour*cw+1,y:T+i*ch+1,width:cw-2,height:ch-2,rx:3,fill:`var(--q${q})`},svg),`<b>${esc(c.label)} · ${pad(c.hour)}:00</b><br>${c.rate}% problem rate over ${c.hours} hour(s)`)})}
+  B.grid.forEach(c=>{const i=ids.indexOf(c.device),q=!c.rate?0:Math.min(5,1+Math.floor(4*c.rate/mx));hover(el("rect",{x:L+c.hour*cw+1,y:T+i*ch+1,width:cw-2,height:ch-2,rx:3,fill:`var(--q${q})`},svg),`<b>${esc(c.label)} · ${pad(c.hour)}:00–${pad(c.hour)}:59</b><br>${c.rate}% problem rate over ${c.hours} hour(s)<br>${bdetail(c)}`)})}
  const f=(v,u)=>v==null?"—":Math.round(v*10)/10+u;
- $("b_table").innerHTML="<tr><th>Apartment</th><th>Problem rate evening / rest</th><th>Router p95 evening / rest</th><th>Wi-Fi signal</th><th>Networks on same channel</th><th>Devices on LAN</th><th>Last report</th></tr>"+B.devices.map(d=>`<tr><td>${esc(d.label)}</td><td class="num">${f(d.rate_eve,"%")} / ${f(d.rate_other,"%")}</td><td class="num">${ms(d.router_eve)} / ${ms(d.router_other)}</td><td class="num">${f(d.rssi," dBm")}</td><td class="num">${f(d.same_block,"")}</td><td class="num">${f(d.lan,"")}</td><td class="num">${new Date(d.last*1000).toLocaleString([], {month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}</td></tr>`).join("")}
+ $("b_table").innerHTML="<tr><th>Apartment</th><th>Problem rate evening / rest</th><th>Router p95 evening / rest</th><th>Usually breaks at</th><th>Wi-Fi signal</th><th>Networks on same channel</th><th>Devices on LAN</th><th>Last report</th></tr>"+B.devices.map(d=>`<tr><td>${esc(d.label)}</td><td class="num">${f(d.rate_eve,"%")} / ${f(d.rate_other,"%")}</td><td class="num">${ms(d.router_eve)} / ${ms(d.router_other)}</td><td>${esc(d.breaks_at||"—")}</td><td class="num">${f(d.rssi," dBm")}</td><td class="num">${f(d.same_block,"")}</td><td class="num">${f(d.lan,"")}</td><td class="num">${new Date(d.last*1000).toLocaleString([], {month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}</td></tr>`).join("");
+ $("b_table").querySelectorAll("tr").forEach((tr,i)=>{if(i)hover(tr,`<b>${esc(B.devices[i-1].label)}, last ${B.days||7} days</b><br>${bdetail(B.devices[i-1].detail)}`)});
+ const tg=B.together||[];$("b_tog_box").hidden=!tg.length;
+ $("b_tog").innerHTML=tg.length?"<tr><th>Time</th><th>Failed / online</th><th>Apartments with failures (failed checks)</th></tr>"+tg.map(t=>`<tr><td class="num">${new Date(t.epoch*1000).toLocaleString([],{weekday:"short",month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}</td><td class="num">${t.apts.length} of ${t.online}</td><td>${t.apts.slice(0,12).map(([l,n])=>esc(l)+" ("+n+")").join(", ")}${t.apts.length>12?` and ${t.apts.length-12} more`:""}</td></tr>`).join(""):""}
 if(LIVE){loadConfig();setInterval(loadConfig,300000);$("controls").hidden=false;try{const s=JSON.parse(localStorage.getItem("netmon")||"{}");if(s.hours!=null)$("hours").value=s.hours;window._gw=s.gw||""}catch(e){}
  const save=()=>{try{localStorage.setItem("netmon",JSON.stringify({hours:$("hours").value,gw:$("gw").value}))}catch(e){}};
  $("hours").onchange=()=>{save();refresh()};$("gw").onchange=()=>{save();refresh()};
