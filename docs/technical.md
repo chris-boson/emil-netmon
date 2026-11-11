@@ -45,7 +45,7 @@ Apple's Command Line Tools (or Homebrew's) and installs or updates the backgroun
 
 ## Releases and updates
 
-Running apps read `latest.json` from the newest GitHub release once a day and show **Update now**
+Running apps read `latest.json` from the newest GitHub release every 6 hours (or when you click **Check for updates** at the bottom of the dashboard) and show **Update now**
 when it lists a higher version. The click downloads `EMIL-NetMon.zip`, checks its SHA-256 against
 `latest.json`, replaces the app the launcher last ran from (`~/.netmon/app_path`) and restarts the
 background agent. Nothing updates without that click. Neither the launcher nor `install` ever replaces

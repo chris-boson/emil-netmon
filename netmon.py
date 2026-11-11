@@ -43,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 APP_NAME = "EMIL NetMon"
 # The building's hub (hub/Code.gs on a Google Sheet). Everyone who clicks "Share anonymous stats"
 # sends to it; build_app.sh --hub can point a build somewhere else.
@@ -1197,11 +1197,12 @@ def check_update(d):
     try:
         info = curl_json(f"{releases_url(d)}/latest.json")
     except RuntimeError:
-        return
+        return False
     if vtuple(info.get("version")) > vtuple(VERSION):
         UPDATE.update(latest=str(info["version"]), notes=str(info.get("notes", ""))[:500], sha256=str(info.get("sha256", "")))
     else:
         UPDATE["latest"] = None
+    return True
 
 
 def update_loop(d, stop):
@@ -1211,7 +1212,7 @@ def update_loop(d, stop):
             check_update(d)
         except Exception:
             pass
-        stop.wait(86400 + random.uniform(0, 3600))
+        stop.wait(6 * 3600 + random.uniform(0, 1800))
 
 
 def app_location(d):
@@ -1364,8 +1365,7 @@ def start_server(d, port):
             elif u == "/api/update":
                 threading.Thread(target=apply_update, args=(d,), daemon=True).start()
             elif u == "/api/check-update":
-                check_update(d)
-                out = {"ok": True, "update": UPDATE}
+                out = {"ok": bool(check_update(d)), "update": UPDATE}
             elif u == "/api/share-now":
                 share_once(d)
                 out = {"ok": bool(SHARE_STATUS["ok"]), "status": SHARE_STATUS}
@@ -1547,7 +1547,7 @@ a{color:var(--s1)}
 <div id="s_tell"><h3 style="margin-top:16px">Tell your neighbours</h3><p class="sub">The more apartments share, the stronger the evidence. Paste this into your building chat:</p>
 <textarea id="c_msg" readonly rows="6" style="font:inherit;font-size:13px;width:100%;max-width:640px;padding:8px;border-radius:6px;border:1px solid var(--line);background:var(--surface);color:var(--text)"></textarea>
 <div><button id="c_copy" class="ghost" style="margin-top:6px">Copy message</button></div></div>
-<p class="note" style="margin-top:14px">EMIL NetMon <span id="c_ver"></span> · data in ~/.netmon · <a href="#" id="c_uninstall">Stop monitoring and uninstall</a> (keeps your logs)</p></div>
+<p class="note" style="margin-top:14px">EMIL NetMon <span id="c_ver"></span> · <a href="#" id="c_chk">Check for updates</a> <span id="c_chkmsg"></span> · data in ~/.netmon · <a href="#" id="c_uninstall">Stop monitoring and uninstall</a> (keeps your logs)</p></div>
 </main><div class="tip" id="tip"></div>
 <script>
 const LIVE=/*LIVE*/false;let D=/*DATA*/null;
@@ -1680,6 +1680,10 @@ $("c_save").onclick=async()=>{if(!$("c_label").value.trim()){$("s_need").hidden=
 $("upd_go").onclick=async()=>{updating=C.version;$("upd_go").disabled=true;$("upd_msg").textContent="Updating…";await post("/api/update");
  const t=setInterval(async()=>{if(!updating){clearInterval(t);return}await loadConfig()},2000);setTimeout(()=>{if(updating){clearInterval(t);$("upd_msg").textContent="This is taking long. Open EMIL NetMon again from Applications."}},120000)};
 $("c_copy").onclick=()=>{$("c_msg").select();try{navigator.clipboard.writeText($("c_msg").value)}catch(e){document.execCommand("copy")}$("c_copy").textContent="Copied"};
+$("c_chk").onclick=async e=>{e.preventDefault();const m=$("c_chkmsg");m.textContent="checking…";
+ try{const r=await post("/api/check-update");if(!r.ok)m.textContent="(couldn't reach GitHub, try again later)";
+  else if(r.update&&r.update.latest){m.textContent="";await loadConfig();$("upd").scrollIntoView({behavior:"smooth"})}
+  else m.textContent="(you have the latest version)"}catch(_){m.textContent="(the app isn't running)"}};
 $("c_uninstall").onclick=async e=>{e.preventDefault();if(!confirm("Stop netmon and remove it from login items? Your logs in ~/.netmon are kept."))return;await post("/api/uninstall");document.body.innerHTML='<main><h1>Monitoring stopped</h1><p class="sub">It no longer runs at login. Your logs are still in ~/.netmon. To start again, open the EMIL NetMon app.</p></main>'};
 const RUNGS=["wifi","router","uplink","internet","dns","web"];
 function bdetail(c){const ind=(k,v)=>`<br><span style="padding-left:12px">${esc(k)}: ${v}</span>`;

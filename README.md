@@ -60,7 +60,7 @@ hidden folder `~/.netmon`; delete it to remove everything.
 ## Questions
 
 - **Does it slow down my internet?** No. Each check is a few tiny test messages.
-- **How do I get updates?** When there's a new version, your dashboard shows **Update now**. One click, and your data and settings are kept.
+- **How do I get updates?** When there's a new version, your dashboard shows **Update now** (it checks every few hours; **Check for updates** at the bottom checks right away). One click, and your data and settings are kept.
 - **Windows, iPhone or Android?** Sorry, Mac only for now.
 - **Why the "Open Anyway" step?** Apple charges developers to sign apps. EMIL NetMon is a free
   neighbourhood project, and all its code is public in this repository.
